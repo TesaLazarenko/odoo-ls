@@ -351,7 +351,10 @@ impl BuildScheduler {
         loop {
             // nothing is being built here: apply the invalidations requested by the previous build
             SymbolTable::apply_pending_invalidations(session);
-            if session.sync_odoo.need_rebuild || !Self::has_work(session) {
+            // Modules created by this rebuild (a new dependency...) may trigger `auto_install`
+            // modules: load them in the same rebuild (modules_scope = "dependencies").
+            if session.sync_odoo.need_rebuild
+                || (!Self::has_work(session) && !crate::core::odoo::SyncOdoo::load_triggered_auto_install(session)) {
                 break;
             }
             if DEBUG_THREADS {

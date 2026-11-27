@@ -1,5 +1,7 @@
 use lsp_server::{ErrorCode, ResponseError};
-use lsp_types::{Location, SymbolKind, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolResponse};
+use lsp_types::{Location, Position, Range, SymbolKind, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolResponse};
+
+use crate::core::odoo::SyncOdoo;
 use ruff_text_size::{TextRange, TextSize};
 
 use crate::{S, constants::SymType, core::{entry_point::EntryPointType, file_mgr::{Ast, FileMgr}, symbols::{storage::{SymbolTable, XmlDataParent}, symbol_keys::{SourceFileKey, SymbolKey, XmlTemplateKey}}}, threads::SessionInfo, utils::{HashSet, string_fuzzy_contains}};
@@ -52,7 +54,37 @@ impl WorkspaceSymbolFeature {
             return Err(cancelled());
         }
         WorkspaceSymbolFeature::browse_owl_templates(session, &query, can_resolve_location_range, &mut symbols);
+        WorkspaceSymbolFeature::browse_unloaded_models(session, &query, &mut symbols);
         Ok(Some(WorkspaceSymbolResponse::Nested(symbols)))
+    }
+
+    /**
+     * modules_scope = "dependencies": the models of the modules that are not loaded, from the
+     * module index. Opening one loads its module (see `handle_did_open`).
+     */
+    fn browse_unloaded_models(session: &mut SessionInfo, query: &str, results: &mut Vec<WorkspaceSymbol>) {
+        let Some(addons) = session.sync_odoo.addons_namespace() else { return };
+        let Some(index) = session.sync_odoo.module_index.as_ref() else { return };
+        for entry in index.iter() {
+            if entry.models.is_empty() || SyncOdoo::is_module_loaded(session, addons, &entry.name) {
+                continue;
+            }
+            for model in entry.models.iter() {
+                let model_name = S!("\"") + &model.name + "\"";
+                if !string_fuzzy_contains(&model_name, query) {
+                    continue;
+                }
+                let position = Position::new(model.line, 0);
+                results.push(WorkspaceSymbol {
+                    name: model_name,
+                    kind: SymbolKind::CLASS,
+                    tags: None,
+                    container_name: Some(format!("{} (module not loaded)", entry.name)),
+                    location: lsp_types::OneOf::Left(Location::new(FileMgr::pathname2uri(&model.file), Range::new(position, position))),
+                    data: None,
+                });
+            }
+        }
     }
 
     /**

@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod test_modules_scope;
 mod test_inherits_of_mixin;
 mod test_object_members;
 mod test_xml_id_completion;

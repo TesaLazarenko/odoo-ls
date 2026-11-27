@@ -25,6 +25,9 @@ pub struct ConfigEntry {
     values: HashMap<ConfigKey, ConfigValue>,
 }
 
+/// Accepted values of `modules_scope`.
+pub const MODULES_SCOPE_VALUES: &[&str] = &["all", "dependencies"];
+
 impl Default for ConfigEntry {
     fn default() -> Self {
         let default_values = {
@@ -109,6 +112,7 @@ impl ConfigEntry {
                 key.kind(),
                 ConfigFieldSpecKind::Str
                     | ConfigFieldSpecKind::DiagImportsMode
+                    | ConfigFieldSpecKind::ModulesScope
                     | ConfigFieldSpecKind::MergeMethod
             ),
             "set_str on non-string key {key:?}"
@@ -161,6 +165,10 @@ impl ConfigEntry {
 
     pub fn file_cache(&self) -> bool {
         self.as_bool(ConfigKey::FileCache)
+    }
+    /// `modules_scope = "dependencies"`: load only the modules the workspace modules need.
+    pub fn load_only_dependencies(&self) -> bool {
+        self.opt_str(ConfigKey::ModulesScope) == Some("dependencies")
     }
     /// RAM budget for not-opened files' ASTs and texts, in bytes; `None` = unbounded.
     pub fn ast_cache_size_bytes(&self) -> Option<usize> {

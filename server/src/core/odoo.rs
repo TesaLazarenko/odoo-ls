@@ -206,6 +206,12 @@ pub struct SyncOdoo {
     pub tsserver_bridge: Option<TsServerBridge>,
     pub js_templates: HashMap<String, WeakSet<XmlTemplateKey>>,
     pub component_mgr: ComponentMgr,
+    /// Persistent index of all the modules of the addons paths (`modules_scope =
+    /// "dependencies"` only): knows the modules that are not loaded.
+    pub module_index: Option<crate::core::module_index::ModuleIndex>,
+    /// A module was created after the initial indexing (new dependency, opened file...):
+    /// the `auto_install` modules it triggers must be loaded too (`modules_scope = "dependencies"`).
+    pub modules_added_at_runtime: bool,
 }
 
 unsafe impl Send for SyncOdoo {}
@@ -259,6 +265,8 @@ impl Clone for SyncOdoo {
             tsserver_bridge: None,
             js_templates: self.js_templates.clone(),
             component_mgr: self.component_mgr.clone(),
+            module_index: self.module_index.clone(),
+            modules_added_at_runtime: self.modules_added_at_runtime,
         }
     }
 }
@@ -319,6 +327,8 @@ impl SyncOdoo {
             tsserver_bridge: None,
             js_templates: HashMap::default(),
             component_mgr: ComponentMgr::default(),
+            module_index: None,
+            modules_added_at_runtime: false,
         }
     }
 
@@ -593,6 +603,10 @@ impl SyncOdoo {
         let result = SyncOdoo::build_base(session);
         if result {
             SyncOdoo::build_modules(session);
+            // Files opened while indexing, in modules outside the dependencies of the workspace.
+            if SyncOdoo::load_modules_of_opened_files(session) {
+                BuildScheduler::process_rebuilds(session, false);
+            }
         }
         crate::memprof::phase("done");
         crate::memprof::release_free_memory();
@@ -744,6 +758,7 @@ impl SyncOdoo {
             return;
         };
         let addons_path = session.st()[addons_symbol].paths();
+        let allowed_modules = SyncOdoo::modules_to_load(session, &addons_path);
         let mut modules = vec![];
         for addon_path in addons_path.iter() {
             info!("searching modules in {}", addon_path);
@@ -752,6 +767,7 @@ impl SyncOdoo {
                 for item in Path::new(addon_path).read_dir().expect("Unable to browse and odoo addon directory") {
                     if let Ok(item) = item
                         && item.file_type().unwrap().is_dir() && !session.sync_odoo.modules.contains_key(item.file_name().to_str().unwrap())
+                        && allowed_modules.as_ref().is_none_or(|allowed| item.file_name().to_str().is_some_and(|n| allowed.contains(n)))
                             && let Ok(module_symbol) = SymbolTable::create_module_from_path(session, &item.path(), addons_symbol) {
                                 modules.push(module_symbol);
                             }
@@ -822,6 +838,150 @@ impl SyncOdoo {
         info!("End building modules. {} modules loaded", modules_count);
         session.log_message(MessageType::INFO, format!("End building modules. {} modules loaded", modules_count));
         session.sync_odoo.state_init = InitState::ODOO_READY;
+    }
+
+    /// With `modules_scope = "dependencies"`, the names of the modules to load: what Odoo
+    /// would install for the modules found in the workspace (see
+    /// [`ModuleIndex::install_closure`]). `None` means all of them: the other scope, or no
+    /// module in the workspace (e.g. a workspace that is Odoo itself, or a single file).
+    fn modules_to_load(session: &mut SessionInfo, addons_paths: &[String]) -> Option<std::collections::HashSet<String>> {
+        if !session.sync_odoo.config.load_only_dependencies() {
+            session.sync_odoo.module_index = None;
+            return None;
+        }
+        let dirs: Vec<PathBuf> = addons_paths.iter().map(PathBuf::from).collect();
+        let index = crate::core::module_index::ModuleIndex::load_or_build(&dirs);
+        let workspace_modules = SyncOdoo::workspace_modules(session, &index);
+        let allowed = if workspace_modules.is_empty() || workspace_modules.len() == index.len() {
+            None
+        } else {
+            let closure = index.install_closure(workspace_modules.iter().map(String::as_str));
+            info!("modules_scope = dependencies: loading {} of {} modules ({} in the workspace)", closure.len(), index.len(), workspace_modules.len());
+            Some(closure)
+        };
+        session.sync_odoo.module_index = Some(index);
+        allowed
+    }
+
+    /// For a model name that no loaded module declares: the modules of the addons paths
+    /// that declare it but are not loaded (`modules_scope = "dependencies"`), if any.
+    pub fn unloaded_modules_declaring_model(&self, model: &str) -> Option<Vec<String>> {
+        let index = self.module_index.as_ref()?;
+        let modules = index.modules_declaring_model(model);
+        (!modules.is_empty()).then(|| modules.to_vec())
+    }
+
+    /// Code for a reference to a model that no loaded module declares: OLS03001 (not in the
+    /// dependencies) if an unloaded module of the addons paths declares it, else OLS03002.
+    pub fn unknown_model_code(&self, model: &str) -> crate::core::diagnostics::DiagnosticCode {
+        use crate::core::diagnostics::DiagnosticCode;
+        if self.unloaded_modules_declaring_model(model).is_some() { DiagnosticCode::OLS03001 } else { DiagnosticCode::OLS03002 }
+    }
+
+    /// The modules of the index that lie in a workspace folder. Paths are compared canonically:
+    /// addons paths are canonicalized by the configuration, workspace folders are not (a
+    /// workspace opened through a symlink would match nothing).
+    fn workspace_modules(session: &SessionInfo, index: &crate::core::module_index::ModuleIndex) -> Vec<String> {
+        let workspace_dirs: Vec<PathBuf> = {
+            session.file_mgr().get_processed_workspace_folders().into_iter()
+                .map(|(_, path)| std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(path)))
+                .collect()
+        };
+        index.iter()
+            .filter(|e| {
+                let path = std::fs::canonicalize(&e.path).unwrap_or_else(|_| PathBuf::from(&e.path));
+                workspace_dirs.iter().any(|w| path.starts_with(w))
+            })
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    pub fn is_module_loaded(session: &SessionInfo, addons: NamespaceKey, name: &str) -> bool {
+        session.st()[addons].get_child(name).is_some_and(|s| matches!(s, SymbolKey::Module(_)))
+    }
+
+    /// `modules_scope = "dependencies"`: create the modules `names` of the index that are not
+    /// loaded yet and queue them for building (their own dependencies are loaded by the build).
+    /// Returns the number of modules created; the caller processes the rebuilds.
+    fn load_index_modules(session: &mut SessionInfo, names: impl IntoIterator<Item = String>, reason: &str) -> usize {
+        let Some(addons) = session.sync_odoo.addons_namespace() else { return 0 };
+        let Some(index) = session.sync_odoo.module_index.as_ref() else { return 0 };
+        let mut to_create: Vec<(String, PathBuf)> = names.into_iter()
+            .filter_map(|name| index.get(&name).map(|e| (name, PathBuf::from(&e.path))))
+            .collect();
+        to_create.retain(|(name, _)| !SyncOdoo::is_module_loaded(session, addons, name));
+        to_create.sort();
+        let mut created = vec![];
+        for (name, path) in to_create {
+            match SymbolTable::create_module_from_path(session, &path, addons) {
+                Ok(module) => {
+                    BuildScheduler::queue(session, BuildableSymbolKey::Module(module));
+                    created.push(name);
+                },
+                Err(CreateError::NothingOnDisk) => warn!("module {name} is no longer at {}", path.sanitize_cow()),
+                Err(CreateError::Existing(existing)) => warn!("unable to load module {name}: {:?} already holds the name", existing.typ()),
+            }
+        }
+        if !created.is_empty() {
+            info!("modules_scope = dependencies: loading {} more module(s) ({reason}): {}", created.len(), created.join(", "));
+            session.log_message(MessageType::INFO, format!("Loading {} more module(s) ({reason}): {}", created.len(), created.join(", ")));
+        }
+        created.len()
+    }
+
+    /// `modules_scope = "dependencies"`, after modules were added at runtime: load the
+    /// `auto_install` modules that the loaded set now triggers, as Odoo would install them
+    /// (e.g. `sale_crm` once a module of the workspace depends on both `sale` and `crm`).
+    /// Returns true if modules were queued.
+    pub fn load_triggered_auto_install(session: &mut SessionInfo) -> bool {
+        if !std::mem::take(&mut session.sync_odoo.modules_added_at_runtime) || session.sync_odoo.state_init != InitState::ODOO_READY {
+            return false;
+        }
+        let Some(addons) = session.sync_odoo.addons_namespace() else { return false };
+        let Some(index) = session.sync_odoo.module_index.as_ref() else { return false };
+        let loaded: Vec<String> = index.iter()
+            .filter(|e| SyncOdoo::is_module_loaded(session, addons, &e.name))
+            .map(|e| e.name.clone())
+            .collect();
+        let missing: Vec<String> = index.install_closure(loaded.iter().map(String::as_str)).into_iter()
+            .filter(|name| !SyncOdoo::is_module_loaded(session, addons, name))
+            .collect();
+        SyncOdoo::load_index_modules(session, missing, "auto_install") > 0
+    }
+
+    /// `modules_scope = "dependencies"`: load the module of the index that contains `path`, if
+    /// it is not loaded yet (a file of a module outside the dependencies of the workspace was
+    /// opened). Returns true if it was queued.
+    pub fn load_module_of_path(session: &mut SessionInfo, path: &Path) -> bool {
+        let Some(index) = session.sync_odoo.module_index.as_ref() else { return false };
+        let Some(name) = index.module_of_path(path).map(|e| e.name.clone()) else { return false };
+        SyncOdoo::load_index_modules(session, [name], "file opened") > 0
+    }
+
+    /// [`SyncOdoo::load_module_of_path`] for the files opened while indexing.
+    fn load_modules_of_opened_files(session: &mut SessionInfo) -> bool {
+        let opened = session.sync_odoo.opened_files.clone();
+        let mut loaded = false;
+        for path in opened {
+            loaded |= SyncOdoo::load_module_of_path(session, Path::new(&path));
+        }
+        loaded
+    }
+
+    /// `modules_scope = "dependencies"`, after the workspace folders changed: load what Odoo
+    /// would install for the modules now in the workspace. Modules of removed folders stay
+    /// loaded until the next restart. Returns true if modules were queued.
+    pub fn load_workspace_closure(session: &mut SessionInfo) -> bool {
+        if session.sync_odoo.state_init != InitState::ODOO_READY {
+            return false;
+        }
+        let Some(index) = session.sync_odoo.module_index.as_ref() else { return false };
+        let workspace_modules = SyncOdoo::workspace_modules(session, index);
+        if workspace_modules.is_empty() {
+            return false;
+        }
+        let closure = index.install_closure(workspace_modules.iter().map(String::as_str));
+        SyncOdoo::load_index_modules(session, closure, "workspace folders changed") > 0
     }
 
     /// Sort modules by load order
@@ -2017,12 +2177,17 @@ impl Odoo {
     }
 
     pub fn handle_did_change_workspace_folders(session: &mut SessionInfo, params: DidChangeWorkspaceFoldersParams) {
-        let file_mgr = session.file_mgr_mut();
-        for added in params.event.added {
-            file_mgr.add_workspace_folder(added.name.clone(), added.uri);
+        {
+            let file_mgr = session.file_mgr_mut();
+            for added in params.event.added {
+                file_mgr.add_workspace_folder(added.name.clone(), added.uri);
+            }
+            for removed in params.event.removed {
+                file_mgr.remove_workspace_folder(removed.name.clone(), removed.uri);
+            }
         }
-        for removed in params.event.removed {
-            file_mgr.remove_workspace_folder(removed.name.clone(), removed.uri);
+        if SyncOdoo::load_workspace_closure(session) {
+            BuildScheduler::process_rebuilds(session, false);
         }
     }
 
@@ -2139,6 +2304,13 @@ impl Odoo {
                                         .contains_key(sanitized_path.as_ref())
                             });
                             if needs_custom_entry {
+                                // modules_scope = "dependencies": a file of a module that is not
+                                // loaded (outside the dependencies of the workspace). Load the
+                                // module rather than making the file a custom entry point.
+                                if SyncOdoo::load_module_of_path(session, &path) {
+                                    BuildScheduler::process_rebuilds(session, false);
+                                    return;
+                                }
                                 // A didOpen can arrive before didCreate. If path is a new asset,
                                 // load it here so it doesn't become a custom entry point
                                 if ModuleSymbol::load_path_assets(session, &path) {

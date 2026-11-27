@@ -1048,9 +1048,9 @@ impl PythonArchEvalHooks {
                 }
             }
         } else if in_validation && has_class_in_parents {
-            // Model Unknown
+            // Model Unknown (or declared by a module that is not loaded: not in the dependencies)
             let range = context.get(ContextKey::Range).unwrap().as_text_range();
-            diagnostics.extend(create_diag(session, DiagnosticCode::OLS03002, &[], range));
+            diagnostics.extend(create_diag(session, session.sync_odoo.unknown_model_code(s), &[], range));
             let Some(file_symbol) = scope.and_then(|scope| session.st().get_file(scope)) else {
               return res
             };
@@ -1373,7 +1373,7 @@ impl PythonArchEvalHooks {
             return diagnostics;
         }
         let Some(model) = session.model_mgr().get_model_key(returns_str) else {
-            diagnostics.extend(create_diag(session, DiagnosticCode::OLS03002, &[], expr.range()));
+            diagnostics.extend(create_diag(session, session.sync_odoo.unknown_model_code(returns_str), &[], expr.range()));
             return diagnostics;
         };
         let Some(main_model_sym) = session.model_mgr()[model]

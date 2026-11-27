@@ -26,6 +26,7 @@ pub enum ConfigKey {
     AdditionalLanguages,
     FileCache,
     AstCacheSize,
+    ModulesScope,
     DiagMissingImports,
     AcFilterModelNames,
     AutoRefreshDelay,
@@ -92,6 +93,13 @@ pub(super) fn specs() -> Vec<FieldSpec> {
         // that are not open in the editor. Least recently used ones are dropped beyond it
         // and re-read/re-parsed from disk on demand. 0 keeps everything (legacy behaviour).
         FieldSpec::new(AstCacheSize, "ast_cache_size", U64).default(ConfigValue::u64(64)),
+        // "dependencies" (default): load only the modules that the workspace modules need
+        // (their `depends`, recursively, plus the `auto_install` modules they trigger); the
+        // others stay on disk, known through the persistent module index (manifests and
+        // declared models). "all": load every module found in the addons paths (as before).
+        FieldSpec::new(ConfigKey::ModulesScope, "modules_scope", super::spec::ConfigFieldSpecKind::ModulesScope)
+            .default(ConfigValue::str("dependencies"))
+            .triggers_restart(),
         FieldSpec::new(DiagMissingImports, "diag_missing_imports", DiagImportsMode)
             .default(ConfigValue::str("all")),
         FieldSpec::new(AcFilterModelNames, "ac_filter_model_names", Bool)

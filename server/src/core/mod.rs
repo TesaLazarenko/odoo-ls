@@ -17,6 +17,7 @@ pub mod js_module_scope;
 pub mod js_utils;
 pub mod js_validator;
 pub mod model;
+pub mod module_index;
 pub mod module_load_order;
 pub mod odoo;
 pub mod pre_parser;

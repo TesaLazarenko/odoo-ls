@@ -27,6 +27,7 @@ pub(crate) enum ConfigFieldSpecKind {
     Str,
     StrList,
     DiagImportsMode,
+    ModulesScope,
     MergeMethod,
     DiagSettings,
     DiagFilters,

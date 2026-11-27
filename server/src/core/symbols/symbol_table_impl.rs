@@ -798,6 +798,9 @@ impl SymbolTable {
                 let module = Self::add_new_module_package(session, addons, &name, path)?;
                 let dir_name = session.st()[module].dir_name.clone();
                 session.sync_odoo.modules.insert(dir_name, module.into());
+                if session.sync_odoo.state_init == crate::core::odoo::InitState::ODOO_READY {
+                    session.sync_odoo.modules_added_at_runtime = true;
+                }
                 return Ok(module.into());
             } else {
                 if path.join("__init__.py").exists() || path.join("__init__.pyi").exists() {
@@ -837,6 +840,9 @@ impl SymbolTable {
         let module = Self::add_new_module_package(session, addons, name, path)?;
         let dir_name = session.sync_odoo.symbol_table[module].dir_name.clone();
         session.sync_odoo.modules.insert(dir_name, module.into());
+        if session.sync_odoo.state_init == crate::core::odoo::InitState::ODOO_READY {
+            session.sync_odoo.modules_added_at_runtime = true;
+        }
         Ok(module)
     }
 

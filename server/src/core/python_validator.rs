@@ -781,7 +781,7 @@ impl PythonValidator {
                 }
             }
         } else {
-            self.diagnostics.extend(create_diag(session, DiagnosticCode::OLS03002, &[], range));
+            self.diagnostics.extend(create_diag(session, session.sync_odoo.unknown_model_code(model_name), &[], range));
             let Some(file_symbol) = session.st().get_file(class_key.into()) else {
               return;
             };

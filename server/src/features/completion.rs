@@ -824,6 +824,34 @@ fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_
                     });
                     }
                 }
+                // modules_scope = "dependencies": the models of the modules that are not loaded
+                // are never in the dependencies of the current module.
+                if (current_module.is_none() || session.sync_odoo.config.ac_filter_model_names())
+                    && let Some(addons) = session.sync_odoo.addons_namespace()
+                    && let Some(index) = session.sync_odoo.module_index.as_ref() {
+                    for (model_name, modules) in index.models() {
+                        if !model_name.starts_with(prefix) || session.model_mgr().get_model_key(model_name).is_some_and(|model| session.model_mgr()[model].has_symbols(session.st())) {
+                            continue;
+                        }
+                        let unloaded: Vec<&str> = modules.iter().map(String::as_str)
+                            .filter(|m| !SyncOdoo::is_module_loaded(session, addons, m))
+                            .collect();
+                        if unloaded.is_empty() {
+                            continue;
+                        }
+                        items.push(CompletionItem {
+                            label: model_name.to_string(),
+                            insert_text: model_name.strip_prefix(prefix_head).map(|s| s.to_string()),
+                            kind: Some(lsp_types::CompletionItemKind::CLASS),
+                            label_details: Some(CompletionItemLabelDetails {
+                                detail: None,
+                                description: Some(format!("require {}", unloaded.join(", "))),
+                            }),
+                            sort_text: Some(model_name.to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
             },
             ExpectedType::DOMAIN(_) => {},
             ExpectedType::DOMAIN_OPERATOR => {

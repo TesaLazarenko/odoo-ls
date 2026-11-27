@@ -49,6 +49,7 @@ fn field_schema(key: ConfigKey) -> Value {
         ConfigFieldSpecKind::U64 => json!({"type": "integer", "minimum": 0}),
         ConfigFieldSpecKind::Str => json!({"type": "string"}),
         ConfigFieldSpecKind::DiagImportsMode => json!({"enum": ["none", "only_odoo", "all"]}),
+        ConfigFieldSpecKind::ModulesScope => json!({"enum": super::runtime::MODULES_SCOPE_VALUES}),
         ConfigFieldSpecKind::MergeMethod => json!({"enum": MergeMethod::VALUES}),
         ConfigFieldSpecKind::StrList => json!({"type": "array", "items": {"type": "string"}}),
         ConfigFieldSpecKind::DiagSettings => json!({

@@ -154,6 +154,13 @@ fn parse_value(
                 .map_err(|_| format!("invalid value '{s}' for '{name}'"))?;
             Ok(Some(scalar(Scalar::Str(s.to_string()), source)))
         }
+        ConfigFieldSpecKind::ModulesScope => {
+            let s = as_str_field(value, name)?;
+            if !super::runtime::MODULES_SCOPE_VALUES.contains(&s) {
+                return Err(format!("invalid value '{s}' for '{name}'"));
+            }
+            Ok(Some(scalar(Scalar::Str(s.to_string()), source)))
+        }
         ConfigFieldSpecKind::MergeMethod => {
             let s = as_str_field(value, name)?;
             // Validate the enum value (the valid set lives on `MergeMethod`).

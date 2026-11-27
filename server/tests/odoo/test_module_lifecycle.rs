@@ -33,6 +33,8 @@ fn test_namespace_becomes_module_when_manifest_is_created() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let (mut odoo, mut config) = common::setup_server(true);
     config.set_string_list(ConfigKey::AddonsPaths, [fixtures.sanitize(), addons_path.sanitize()]);
+    // `importer` is neither in the workspace nor a dependency of it: only loaded with "all".
+    config.set_str(ConfigKey::ModulesScope, "all".to_string());
     let mut session = common::create_init_session(&mut odoo, config);
 
     let addons = session.sync_odoo.addons_namespace().expect("odoo/addons namespace should exist");
