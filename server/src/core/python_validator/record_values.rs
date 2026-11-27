@@ -1,10 +1,8 @@
-use crate::core::diagnostics::{DiagnosticCode, create_diagnostic};
-use crate::core::file_mgr::FileMgr;
+use crate::core::diagnostics::{create_diag, Diag, DiagnosticCode};
 use crate::core::symbols::SymbolTable;
 use crate::core::symbols::symbol_keys::{ModelSymbolKey, ModuleKey};
 use crate::features::features_utils::SpecialArg;
 use crate::threads::SessionInfo;
-use lsp_types::Diagnostic;
 use ruff_python_ast::Expr;
 use ruff_text_size::Ranged;
 
@@ -16,7 +14,7 @@ pub(crate) fn validate_record_values_arg(
     model: Option<ModelSymbolKey>,
     from_module: Option<ModuleKey>,
     value: &Expr,
-) -> Vec<Diagnostic> {
+) -> Vec<Diag> {
     let Some(model) = model else {
         return vec![];
     };
@@ -41,13 +39,10 @@ pub(crate) fn validate_record_values_arg(
             .0
             .is_empty();
             if is_empty
-                && let Some(diagnostic_base) =
-                    create_diagnostic(session, DiagnosticCode::OLS03014, &[])
+                && let Some(diagnostic) =
+                    create_diag(session, DiagnosticCode::OLS03014, &[], field_name.range())
             {
-                diagnostics.push(Diagnostic {
-                    range: FileMgr::textRange_to_temporary_Range(&field_name.range()),
-                    ..diagnostic_base
-                });
+                diagnostics.push(diagnostic);
             }
         }
     }

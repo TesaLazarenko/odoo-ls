@@ -1,9 +1,7 @@
-use lsp_types::Diagnostic;
 use ruff_python_ast::{Expr, ExprStringLiteral};
 use ruff_text_size::Ranged;
-use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
+use crate::core::diagnostics::{create_diag, Diag, DiagnosticCode};
 use crate::core::evaluation_utils::DeepFieldEvalWalker;
-use crate::core::file_mgr::FileMgr;
 use crate::core::symbols::symbol_keys::{ClassKey, ModelSymbolKey, ModuleKey};
 use crate::features::ast_utils::AstUtils;
 use crate::features::features_utils::OrderItem;
@@ -16,7 +14,7 @@ pub(crate) fn validate_order_arg(
     model: Option<ModelSymbolKey>,
     from_module: Option<ModuleKey>,
     value: &Expr,
-) -> Vec<Diagnostic> {
+) -> Vec<Diag> {
     if let Expr::StringLiteral(order_string) = value
         && let Some(model_class) = model.and_then(|model| model.as_class_key())
     {
@@ -32,7 +30,7 @@ pub(super) fn validate_order(
     class: ClassKey,
     maybe_from_module: Option<ModuleKey>,
     order_string: &ExprStringLiteral,
-) -> Vec<Diagnostic> {
+) -> Vec<Diag> {
     let mut diagnostics = vec![];
     let order = order_string.value.to_str();
     if order.is_empty() {
@@ -80,7 +78,7 @@ pub(super) fn validate_order(
 /// Its field must exist, and a many2one only accepts `.id` as property.
 fn check_order_item(
     session: &mut SessionInfo,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Vec<Diag>,
     class: ClassKey,
     maybe_from_module: Option<ModuleKey>,
     order_string: &ExprStringLiteral,
@@ -153,7 +151,7 @@ fn check_order_item(
 /// a `nulls` without `first` or `last`, and more than one space in `nulls first` or `nulls last`.
 fn check_order_keywords(
     session: &SessionInfo,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Vec<Diag>,
     order_string: &ExprStringLiteral,
     item: &OrderItem,
 ) {
@@ -222,19 +220,13 @@ fn check_order_keywords(
 /// found in the file.
 fn push_order_diagnostic(
     session: &SessionInfo,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Vec<Diag>,
     code: DiagnosticCode,
     params: &[&str],
     order_string: &ExprStringLiteral,
     start: usize,
     end: usize,
 ) {
-    let Some(diagnostic_base) = create_diagnostic(session, code, params) else {
-        return;
-    };
     let range = AstUtils::range_in_file(order_string, start, end).unwrap_or(order_string.range());
-    diagnostics.push(Diagnostic {
-        range: FileMgr::textRange_to_temporary_Range(&range),
-        ..diagnostic_base
-    });
+    diagnostics.extend(create_diag(session, code, params, range));
 }

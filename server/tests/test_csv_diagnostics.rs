@@ -10,7 +10,7 @@ use std::path::Path;
 mod setup;
 mod test_utils;
 
-fn csv_test_paths() -> (String, String, String, String, String) {
+fn csv_test_paths() -> (String, String, String, String, String, String, String) {
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
@@ -25,6 +25,12 @@ fn csv_test_paths() -> (String, String, String, String, String) {
     let duplicate_column = test_addons_path
         .join("module_csv").join("data").join("csv_duplicate_column").join("res.country.state.csv")
         .sanitize();
+    let unknown_model = test_addons_path
+        .join("module_csv").join("data").join("csv_unknown_model").join("not.a.model.csv")
+        .sanitize();
+    let unknown_model_empty = test_addons_path
+        .join("module_csv").join("data").join("csv_unknown_model_empty").join("not.a.model.csv")
+        .sanitize();
     let valid_csv = test_addons_path
         .join("module_for_diagnostics").join("data").join("bike_parts.wheel.csv")
         .sanitize();
@@ -32,11 +38,28 @@ fn csv_test_paths() -> (String, String, String, String, String) {
         .join("module_for_diagnostics").join("data").join("bikes.bike.csv")
         .sanitize();
 
-    for path in [&field_mismatch, &invalid_xml_id, &duplicate_column, &valid_csv, &relational_ids] {
+    for path in [&field_mismatch, &invalid_xml_id, &duplicate_column, &unknown_model, &unknown_model_empty, &valid_csv, &relational_ids] {
         assert!(Path::new(path).exists(), "Test file does not exist: {}", path);
     }
 
-    (field_mismatch, invalid_xml_id, duplicate_column, valid_csv, relational_ids)
+    (field_mismatch, invalid_xml_id, duplicate_column, unknown_model, unknown_model_empty, valid_csv, relational_ids)
+}
+
+fn diagnostics_csv_path(dir: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests").join("data").join("addons")
+        .join("module_for_diagnostics").join("data").join(dir).join("bikes.bike.csv")
+        .sanitize();
+    assert!(Path::new(&path).exists(), "Test file does not exist: {}", path);
+    path
+}
+
+/// The text a single-line diagnostic covers, read by UTF-16 column on BMP-only text.
+fn diag_text(path: &str, diag: &Diagnostic) -> String {
+    let content = std::fs::read_to_string(path).unwrap();
+    let line = content.lines().nth(diag.range.start.line as usize).expect("diagnostic line");
+    let (start, end) = (diag.range.start.character as usize, diag.range.end.character as usize);
+    line.chars().skip(start).take(end - start).collect()
 }
 
 fn collect_all_csv_diagnostics(session: &mut SessionInfo, paths: &[&str]) -> HashMap<String, Vec<Diagnostic>> {
@@ -60,19 +83,25 @@ fn test_csv_diagnostics() {
     let (mut odoo, config) = setup::setup::setup_server(true);
     let mut session = setup::setup::create_init_session(&mut odoo, config);
 
-    let (field_mismatch, invalid_xml_id, duplicate_column, valid_csv, relational_ids) = csv_test_paths();
+    let (field_mismatch, invalid_xml_id, duplicate_column, unknown_model, unknown_model_empty, valid_csv, relational_ids) = csv_test_paths();
+    let escapes = diagnostics_csv_path("csv_escapes");
+    let bom = diagnostics_csv_path("csv_bom");
 
     // Collect all diagnostics in one pass (consuming the message queue once)
     let all_diags = collect_all_csv_diagnostics(
         &mut session,
-        &[&field_mismatch, &invalid_xml_id, &duplicate_column, &valid_csv, &relational_ids],
+        &[&field_mismatch, &invalid_xml_id, &duplicate_column, &unknown_model, &unknown_model_empty, &valid_csv, &relational_ids, &escapes, &bom],
     );
 
     test_field_count_mismatch(get_diags_for(&all_diags, &field_mismatch));
     test_xml_id_format(get_diags_for(&all_diags, &invalid_xml_id));
     test_duplicate_column(get_diags_for(&all_diags, &duplicate_column));
+    test_unknown_model(get_diags_for(&all_diags, &unknown_model), 12);
+    test_unknown_model(get_diags_for(&all_diags, &unknown_model_empty), 0);
     test_valid_file_no_errors(get_diags_for(&all_diags, &valid_csv));
     test_relational_id_column(get_diags_for(&all_diags, &relational_ids), &relational_ids);
+    test_escaped_quotes_before_id(get_diags_for(&all_diags, &escapes), &escapes);
+    test_bom_unknown_first_column(get_diags_for(&all_diags, &bom), &bom);
 }
 
 /// OLS05069: header has 4 fields, data row has 3
@@ -177,6 +206,24 @@ fn test_duplicate_column(diagnostics: &[Diagnostic]) {
     assert_eq!(diag.range.end, lsp_types::Position::new(0, 21));
 }
 
+/// OLS05056: the file name is not a known model, the diagnostic spans the header row
+/// File: csv_unknown_model/not.a.model.csv
+///   Line 0: id,name,code
+/// File: csv_unknown_model_empty/not.a.model.csv is empty, so the range is 0..0
+fn test_unknown_model(diagnostics: &[Diagnostic], end: u32) {
+    let model_diags: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05056")).collect();
+    assert_eq!(model_diags.len(), 1, "Expected a single OLS05056, got: {:?}", diagnostics);
+
+    let diag = model_diags[0];
+    assert!(
+        diag.message.contains("not.a.model"),
+        "OLS05056 message should name the model, got: {}",
+        diag.message
+    );
+    assert_eq!(diag.range.start, lsp_types::Position::new(0, 0));
+    assert_eq!(diag.range.end, lsp_types::Position::new(0, end));
+}
+
 /// Well-formed CSV: no error-level diagnostics expected
 /// File: bike_parts.wheel.csv
 ///   Line 0: id,name,price,bike_id
@@ -211,4 +258,19 @@ fn test_relational_id_column(diagnostics: &[Diagnostic], path: &str) {
     let range = &unknown[0].range;
     let line = content.lines().nth(range.start.line as usize).expect("diagnostic line");
     assert_eq!(&line[range.start.character as usize..range.end.character as usize], "bike_wheel_DOES_NOT_EXIST");
+}
+
+/// `""` escapes and multi-byte characters in an earlier cell must not shift the id range
+fn test_escaped_quotes_before_id(diagnostics: &[Diagnostic], path: &str) {
+    let unknown: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05001")).collect();
+    assert_eq!(unknown.len(), 1, "Expected one unknown id, got: {:?}", diagnostics);
+    assert_eq!(diag_text(path, unknown[0]), "bike_wheel_ESCAPED_MISSING");
+}
+
+/// The header range of a BOM file must not start inside the BOM
+fn test_bom_unknown_first_column(diagnostics: &[Diagnostic], path: &str) {
+    let unknown: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05057")).collect();
+    assert_eq!(unknown.len(), 1, "Expected one unknown column, got: {:?}", diagnostics);
+    // the disk text keeps the BOM and counts it as a column on line 0 (T11)
+    assert_eq!(diag_text(path, unknown[0]), "xy");
 }

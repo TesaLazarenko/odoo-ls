@@ -138,7 +138,7 @@ pub fn resolve_string_symbols(
     if !model_syms.is_empty() {
         return Some(StringResolution::Model(model_syms));
     }
-    let xml_ids = SyncOdoo::get_xml_ids(session, file_symbol, string_val, &std::ops::Range{start: 0, end: 0}, &mut vec![]);
+    let xml_ids = SyncOdoo::get_xml_ids(session, file_symbol, string_val, TextRange::default(), &mut vec![]);
     let xml_syms: Vec<_> = xml_ids.iter_valid(session.st()).collect();
     if !xml_syms.is_empty() {
         return Some(StringResolution::XmlId(xml_syms));

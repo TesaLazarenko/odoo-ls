@@ -1,4 +1,5 @@
 use regex::Regex;
+use ruff_text_size::TextRange;
 use itertools::Itertools;
 use crate::core::file_mgr::FileMgr;
 use crate::core::odoo::SyncOdoo;
@@ -142,7 +143,7 @@ pub fn build_markdown_description(
                 string_handled = true;
             }
             if let Some(file_sym) = file_symbol {
-                let xml_ids = SyncOdoo::get_xml_ids(session, file_sym, str, &std::ops::Range { start: 0, end: 0 }, &mut vec![]);
+                let xml_ids = SyncOdoo::get_xml_ids(session, file_sym, str, TextRange::default(), &mut vec![]);
                 for xml_id in xml_ids.iter_valid(session.st()) {
                     if let XmlId::XmlRecord(record_key) = xml_id
                         && let Some(xml_block) = format_xml_record_block(session, record_key) {

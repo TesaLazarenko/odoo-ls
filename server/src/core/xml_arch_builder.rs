@@ -1,14 +1,13 @@
 use crate::{
-    Sy, constants::{BuildStatus, BuildSteps, DEBUG_STEPS, DiagnosticSource, MissingDataSource}, core::{build_scheduler::BuildScheduler, entry_point::{EntryPoint, EntryPointType}, file_mgr::FileInfoKey, symbols::{ModuleSymbol, SymbolTable, symbol_keys::{XmlDataKey, XmlId}}}, threads::SessionInfo
+    Sy, constants::{BuildStatus, BuildSteps, DEBUG_STEPS, DiagnosticSource, MissingDataSource}, core::{build_scheduler::BuildScheduler, diagnostics::{Diag, create_diag}, entry_point::{EntryPoint, EntryPointType}, file_mgr::FileInfoKey, symbols::{ModuleSymbol, SymbolTable, symbol_keys::{XmlDataKey, XmlId}}}, threads::SessionInfo, utils::TextRanged
 };
-use crate::{
+use crate::
     core::{
         data_hooks,
-        diagnostics::{create_diagnostic, DiagnosticCode},
+        diagnostics::DiagnosticCode,
         symbols::{Buildable, symbol_keys::XmlFileKey},
-    },
-};
-use lsp_types::Diagnostic;
+    }
+;
 use roxmltree::Node;
 use tracing::{info, error, warn};
 
@@ -59,7 +58,7 @@ impl XmlArchBuilder {
         t_name: Option<String>,
         node: &Node,
         xml_data: XmlDataKey,
-        diagnostics: &mut Vec<Diagnostic>
+        diagnostics: &mut Vec<Diag>
     ) {
         if !self.is_in_main_ep {
             return;
@@ -72,15 +71,7 @@ impl XmlArchBuilder {
             };
             let id_split = id.split(".").collect::<Vec<&str>>();
             if id_split.len() > 2 {
-                if let Some(diagnostic) = create_diagnostic(session, DiagnosticCode::OLS05051, &[&id]) {
-                    diagnostics.push(lsp_types::Diagnostic {
-                        range: lsp_types::Range {
-                            start: lsp_types::Position::new(node.range().start as u32, 0),
-                            end: lsp_types::Position::new(node.range().end as u32, 0),
-                        },
-                        ..diagnostic.clone()
-                    });
-                }
+                diagnostics.extend(create_diag(session, DiagnosticCode::OLS05051, &[&id], node.text_range()));
                 return;
             }
             let id = id_split.last().unwrap().to_string();
