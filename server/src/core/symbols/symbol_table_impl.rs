@@ -1091,6 +1091,7 @@ impl SymbolTable {
     /// `symbol`, that does not have to be reset.
     pub fn invalidate_dependents(session: &mut SessionInfo, symbol: SourceFileKey, step: BuildSteps) {
         let mut vec_to_invalidate = VecDeque::from([symbol]);
+        let mut arch_dependents_seen = HashSet::default();
         while let Some(ref_to_inv) = vec_to_invalidate.pop_front() {
             let in_workspace = session.st().in_workspace(ref_to_inv.into());
             // every level from `step` is not reached anymore: dependents have to rebuild the step that depends on it
@@ -1109,6 +1110,10 @@ impl SymbolTable {
                 }
                 for (dep_step, sym) in build_queue {
                     Self::request_reset(session, sym, dep_step);
+                    // its symbols get new keys, so what was evaluated from them is stale too
+                    if dep_step == BuildSteps::ARCH && arch_dependents_seen.insert(sym) {
+                        vec_to_invalidate.push_back(sym);
+                    }
                 }
                 if level == BuildSteps::ARCH_EVAL as usize {
                     for (model, from_module) in session.st().iter_all_model_keys(session, ref_to_inv.into()) {
@@ -1116,7 +1121,9 @@ impl SymbolTable {
                     }
                 }
             }
-            if let Ok(parent) = FileSystemSymbolParent::try_from(SymbolKey::from(ref_to_inv)) {
+            if !arch_dependents_seen.contains(&ref_to_inv)
+                && let Ok(parent) = FileSystemSymbolParent::try_from(SymbolKey::from(ref_to_inv))
+            {
                 let all_module_symbols = parent.children(session.st());
                 for sym in all_module_symbols.into_iter().filter_map(|s| s.as_source_file_key()) {
                     vec_to_invalidate.push_back(sym);
