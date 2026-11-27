@@ -1,7 +1,7 @@
 use crate::constants::{BuildSteps, PackageType};
 use crate::core::build_scheduler::BuildScheduler;
 use crate::core::evaluation::{Evaluation, EvaluationSymbolPtr};
-use crate::core::file_mgr::{Ast, AstKind, FileInfoKey};
+use crate::core::file_mgr::{Ast, AstKind, FileInfo, FileInfoKey};
 use crate::core::symbols::symbol_table_impl::MemberCache;
 use crate::core::symbols::Dependencies;
 use crate::core::symbols::ModuleSymbol;
@@ -65,6 +65,7 @@ impl ReferenceFeature {
     }
 
     fn get_references_impl(session: &mut SessionInfo, file_symbol: SourceFileKey, file_info: FileInfoKey, line: u32, character: u32) -> Option<Vec<Location>> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         if matches!(session.file_mgr()[file_info].file_info_ast.ast, Ast::JsAst(_)) {
             return ReferenceFeature::get_reference_js(session, file_info, line, character);
         }
@@ -160,6 +161,8 @@ impl ReferenceFeature {
                         let Some(dep_file_info) = session.file_mgr().get_file_info(session.st().file_path(file)) else {
                             continue;
                         };
+                        // The text may have been evicted from the AST/text cache.
+                        session.file_mgr_mut()[dep_file_info].ensure_text_document();
                         // A reference spells the target's name, so skip the files that never contain it. Classes are exceptions, as a `self.env['my.class']` reference it without spelling it, so they are excluded here
                         if target_typ != SymType::CLASS && !session.file_mgr()[dep_file_info].file_info_ast.text_document.as_ref().is_some_and(|td| td.contents().contains(target_name.as_str())) {
                             continue;
@@ -242,6 +245,7 @@ impl ReferenceFeature {
                     for source_file in files_to_process {
                         let file_info = session.file_mgr().get_file_info(session.st().file_path(source_file));
                         if let Some(file_info) = file_info {
+                            session.file_mgr_mut()[file_info].ensure_text_document();
                             let full_xml_id = format!("{}.{}", data_module_name, xml_id);
                             match source_file {
                                 SourceFileKey::File(_)| SourceFileKey::PythonPackage(_) | SourceFileKey::Module(_) => {
@@ -390,6 +394,11 @@ impl ReferenceFeature {
     }
 
     fn references_in_file(session: &mut SessionInfo, file_symbol: SourceFileKey, file_info: FileInfoKey, reference_target: &ReferenceTarget) -> Vec<Location> {
+        // Rebuild an AST evicted from the AST cache (no-op for external files, whose
+        // FileInfo is dropped after validation and which are thus not here).
+        if !session.file_mgr()[file_info].file_info_ast.ast.is_built() {
+            FileInfo::prepare_ast(session, file_info);
+        }
         let Some(py_ast) = session.file_mgr()[file_info].file_info_ast.ast.as_py_ast().cloned() else { //filter modules with only manifest or file outside of workspace
             return vec![];
         };
@@ -410,9 +419,13 @@ impl ReferenceFeature {
         locations
     }
 
-    fn get_manifest_ast(session: &SessionInfo, module: ModuleKey) -> Option<(String, Arc<IndexedModule>)> {
+    fn get_manifest_ast(session: &mut SessionInfo, module: ModuleKey) -> Option<(String, Arc<IndexedModule>)> {
         let manifest_path = Path::new(&session.st()[module].path).join("__manifest__.py").sanitize();
         let file_info = session.file_mgr().get_file_info(&manifest_path)?;
+        // may have been evicted from the AST cache
+        if !session.file_mgr()[file_info].file_info_ast.ast.is_built() {
+            FileInfo::prepare_ast(session, file_info);
+        }
         session.file_mgr()[file_info].file_info_ast.ast.as_py_ast().cloned().map(|py_ast| (manifest_path, py_ast))
     }
 

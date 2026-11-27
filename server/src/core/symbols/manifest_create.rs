@@ -17,6 +17,10 @@ impl ModuleSymbol {
             info!("ARCH       - MANIFEST: {}", manifest_path.sanitize_cow());
         }
         let (_, manifest_file_info) = FileMgr::update_file_info(session, &manifest_path.sanitize_cow(), None, None, false);
+        // An existing entry may hold an AST evicted from the AST cache: reload it.
+        if !session.file_mgr()[manifest_file_info].file_info_ast.ast.is_built() {
+            FileInfo::prepare_ast(session, manifest_file_info);
+        }
         let Some(py_ast) = session.file_mgr()[manifest_file_info].file_info_ast.ast.as_py_ast().cloned() else {
             return;
         };

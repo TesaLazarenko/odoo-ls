@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 use odoo_ls_macros::{SymbolKeySubset};
 use crate::{
     constants::OYarn,
@@ -36,7 +37,7 @@ impl FileContentParent {
         }
     }
     
-    pub(super) fn symbols_mut(self, st: &mut SymbolTable) -> &mut HashMap<OYarn, HashMap<u32, Vec<SymbolKey>>> {
+    pub(super) fn symbols_mut(self, st: &mut SymbolTable) -> &mut HashMap<OYarn, SectionSymbols> {
         match self {
             Self::File(f) => &mut st[f].symbols,
             Self::PythonPackage(p) => &mut st[p].symbols,
@@ -59,9 +60,7 @@ impl FileContentParent {
     pub(super) fn add_child(self, st: &mut SymbolTable, name: &str, child: SymbolKey, position: u32) {
         let section = self.as_symbol_mgr(st).get_section_for(position).index;
         let name = oyarn!("{}", name);
-        self.symbols_mut(st).entry(name).or_default()
-            .entry(section).or_default()
-            .push(child);
+        self.symbols_mut(st).entry(name).or_default().push(section, child);
     } 
     
     pub fn children(&self, st: &SymbolTable) -> impl Iterator<Item = SymbolKey> {

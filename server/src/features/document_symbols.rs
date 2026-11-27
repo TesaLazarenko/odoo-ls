@@ -10,6 +10,7 @@ pub struct DocumentSymbolFeature;
 impl DocumentSymbolFeature {
 
     pub fn get_symbols(session: &mut SessionInfo, file_info: FileInfoKey) -> Option<DocumentSymbolResponse> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         let mut results = vec![];
 
         // JS/TS: delegate to tsserver navtree.

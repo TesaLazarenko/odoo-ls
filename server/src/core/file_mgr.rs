@@ -8,14 +8,15 @@ use lsp_types::notification::{Notification, PublishDiagnostics};
 use ruff_source_file::{LineIndex, OneIndexed, PositionEncoding, SourceLocation};
 use rustc_hash::FxHasher;
 use slotmap::{SlotMap, new_key_type};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use std::path::Path;
 use crate::core::{diagnostics::{Diag, create_diag}, js_arch_builder::{ImportSource, JsDeclaration, JsExportKind, JsImportKind, span_to_range}};
 use crate::core::js_arch_builder::ComponentDescriptor;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
+use std::sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Arc, OnceLock};
 use std::{fs};
+use std::cell::Cell;
 use crate::utils::{HashMap, HashSet};
 use crate::core::{config::{DiagnosticFilter, DiagnosticFilterPathType}, js_arch_builder, js_utils};
 use crate::core::diagnostics::{DiagnosticCode, DiagnosticSetting};
@@ -324,7 +325,18 @@ pub struct FileInfo {
     diagnostic_filters: Vec<DiagnosticFilter>,
 
     pub diag_test_comments: Vec<(u32, Vec<String>)>, //for tests: line and list of codes
+    /// Logical time of the last access, for the LRU eviction of cached ASTs/texts.
+    last_used: Cell<u64>,
 }
+
+/// Monotonic clock for [`FileInfo::touch`].
+static FILE_ACCESS_TICK: AtomicU64 = AtomicU64::new(1);
+/// Estimated bytes of evictable ASTs/texts loaded since the last budget scan; lets
+/// [`FileMgr::enforce_ast_budget`] skip the scan when little was loaded.
+static AST_BYTES_SINCE_SCAN: AtomicUsize = AtomicUsize::new(0);
+/// Measured on Odoo 20.0 with ruff 0.17: 582 MB of `IndexedModule`s for 62.5 MB of
+/// Python source, i.e. ~9.3 bytes of AST (nodes, tokens, node index) per source byte.
+const AST_BYTES_PER_SOURCE_BYTE: usize = 10;
 
 impl FileInfo {
     pub fn new(uri: String) -> Self {
@@ -344,6 +356,74 @@ impl FileInfo {
             noqas_lines: HashMap::default(),
             diagnostic_filters: Vec::new(),
             diag_test_comments: vec![],
+            last_used: Cell::new(0),
+        }
+    }
+
+    /// Mark this file as just used (LRU order of the AST/text cache).
+    pub fn touch(&self) {
+        self.last_used.set(FILE_ACCESS_TICK.fetch_add(1, Ordering::Relaxed));
+    }
+
+    /// Estimated RAM held by data of this file that can be dropped and rebuilt from disk:
+    /// the parsed Python AST and the source text. Opened files are never evictable,
+    /// because their content comes from the editor, not from disk.
+    fn evictable_bytes(&self) -> usize {
+        if self.opened {
+            return 0;
+        }
+        let text_len = self.file_info_ast.text_document.as_ref().map(|td| td.contents().len()).unwrap_or(0);
+        match &self.file_info_ast.ast {
+            Ast::PythonAst(_) => text_len * (1 + AST_BYTES_PER_SOURCE_BYTE),
+            // Data and asset files: their symbols are built, only the text stays around.
+            Ast::XmlAst | Ast::CsvAst | Ast::JsAst(_) => text_len,
+            Ast::Pending => 0,
+        }
+    }
+
+    /// Drop the Python AST and source text (only the text for XML/CSV/JS files). They are
+    /// reloaded by [`Self::prepare_ast`] or [`Self::ensure_text_document`] when needed.
+    /// A Python file is left as `file_cache = false` leaves it after its validation.
+    fn evict_ast(&mut self) {
+        let fia = &mut self.file_info_ast;
+        if matches!(fia.ast, Ast::PythonAst(_)) {
+            fia.ast = Ast::Pending;
+            fia.text_hash = 0; // rebuilt with the AST by `prepare_ast`
+        }
+        // XML/CSV/JS keep their AST and their (still valid) hash: only the text is reloaded,
+        // by `ensure_text_document`, which does not rebuild anything.
+        fia.text_document = None;
+    }
+
+    /// A data/asset file's text was just loaded (its symbols are built from it).
+    fn record_loaded_text(&self) {
+        self.touch();
+        let len = self.file_info_ast.text_document.as_ref().map(|td| td.contents().len()).unwrap_or(0);
+        AST_BYTES_SINCE_SCAN.fetch_add(len, Ordering::Relaxed);
+    }
+
+    fn record_loaded_python_ast(&self) {
+        self.touch();
+        let len = self.file_info_ast.text_document.as_ref().map(|td| td.contents().len()).unwrap_or(0);
+        AST_BYTES_SINCE_SCAN.fetch_add(len * (1 + AST_BYTES_PER_SOURCE_BYTE), Ordering::Relaxed);
+    }
+
+    /// Reload the source text from disk if it was evicted (not for opened or untitled
+    /// files, whose text only lives in memory). Returns whether a text is now present.
+    pub fn ensure_text_document(&mut self) -> bool {
+        if self.file_info_ast.text_document.is_some() {
+            return true;
+        }
+        if self.opened || FileMgr::is_untitled(&self.uri) {
+            return false;
+        }
+        match fs::read_to_string(&self.uri) {
+            Ok(content) => {
+                self.file_info_ast.text_document = Some(TextDocument::new(content, self.version.unwrap_or(-1)));
+                self.record_loaded_text();
+                true
+            }
+            Err(_) => false,
         }
     }
     pub fn update(session: &mut SessionInfo, key: FileInfoKey, path: &str, content: Option<&[TextDocumentContentChangeEvent]>, version: Option<i32>, is_external: bool, force: bool, is_untitled: bool) -> bool {
@@ -438,12 +518,15 @@ impl FileInfo {
         match ext.as_deref() {
             Some("xml") => {
                 session.file_mgr_mut()[key].file_info_ast.ast = Ast::XmlAst;
+                session.file_mgr()[key].record_loaded_text();
             }
             Some("csv") => {
                 session.file_mgr_mut()[key].file_info_ast.ast = Ast::CsvAst;
+                session.file_mgr()[key].record_loaded_text();
             }
             Some("js") | Some("ts") => {
                 FileInfo::build_js_ast(session, key, is_external);
+                session.file_mgr()[key].record_loaded_text();
             }
             _ => {
                 FileInfo::build_python_ast(session, key, is_external);
@@ -461,12 +544,14 @@ impl FileInfo {
             let file = &mut session.file_mgr_mut()[key];
             file.noqas_blocs = parsed.noqas_blocs;
             file.noqas_lines = parsed.noqas_lines;
-            file.diag_test_comments.extend(parsed.diag_test_comments);
+            // Assign, not extend: the AST can be rebuilt after an eviction.
+            file.diag_test_comments = parsed.diag_test_comments;
         }
         let (valid, diagnostics) = Self::syntax_diagnostics(session, &parsed.indexed_module.parsed);
         session.file_mgr_mut()[key].valid = valid;
         session.file_mgr_mut()[key].file_info_ast.ast = Ast::PythonAst(parsed.indexed_module);
         session.file_mgr_mut()[key].replace_diagnostics(DiagnosticSource::PY_SYNTAX, diagnostics);
+        session.file_mgr()[key].record_loaded_python_ast();
     }
 
     /// Build the SYNTAX-step diagnostics (OLS01000) for a parsed Python module.
@@ -504,12 +589,14 @@ impl FileInfo {
                     fia.ast = Ast::PythonAst(parsed.indexed_module);
                 }
                 session.file_mgr_mut()[key].replace_diagnostics(DiagnosticSource::PY_SYNTAX, diagnostics);
+                session.file_mgr()[key].record_loaded_python_ast();
             }
             PreloadedFile::DataFile { text_hash, text_document, ast } => {
                 let fia = &mut session.file_mgr_mut()[key].file_info_ast;
                 fia.text_hash = text_hash;
                 fia.text_document = Some(text_document);
                 fia.ast = ast;
+                session.file_mgr()[key].record_loaded_text();
             }
             PreloadedFile::Js { text_hash, text_document, parsed } => {
                 {
@@ -518,6 +605,7 @@ impl FileInfo {
                     fia.text_document = Some(text_document);
                 }
                 FileInfo::apply_parsed_js(session, key, parsed);
+                session.file_mgr()[key].record_loaded_text();
             }
         }
     }
@@ -760,10 +848,16 @@ impl FileInfo {
     }
 
     pub fn publish_diagnostics(session: &mut SessionInfo, key: FileInfoKey) {
-        let file = &session.file_mgr()[key];
-        if !file.need_push {
+        if !session.file_mgr()[key].need_push {
             return;
         }
+        // Diagnostics keep offsets; converting them to positions needs the text,
+        // which may have been evicted from the AST/text cache.
+        let has_diagnostics = !session.file_mgr()[key].diagnostics.values().all(|d| d.is_empty());
+        if has_diagnostics && !session.file_mgr_mut()[key].ensure_text_document() {
+            return;
+        }
+        let file = &session.file_mgr()[key];
         let mut all_diagnostics = Vec::new();
         let is_js = file.file_info_ast.ast.kind() == AstKind::JsAst;
         let diagnostics = if is_js {
@@ -987,11 +1081,121 @@ impl FileMgr {
     }
 
     pub fn get_file_info(&self, path: &str) -> Option<FileInfoKey> {
-        if Self::is_untitled(path) {
+        let file_info = if Self::is_untitled(path) {
             self.untitled_files.get(path).cloned()
         } else {
             self.files.get(path).cloned()
+        };
+        if let Some(file_info) = file_info {
+            self.file_arena[file_info].touch();
         }
+        file_info
+    }
+
+    /// Make sure `file_info` has its AST and text, rebuilding them from disk if they were
+    /// evicted from the AST/text cache. Called at the entry of the LSP features.
+    pub fn ensure_ast(session: &mut SessionInfo, file_info: FileInfoKey) {
+        if !session.file_mgr()[file_info].file_info_ast.ast.is_built() {
+            FileInfo::prepare_ast(session, file_info);
+        }
+        session.file_mgr_mut()[file_info].ensure_text_document();
+        session.file_mgr()[file_info].touch();
+    }
+
+    /// Keep the estimated RAM of evictable ASTs/texts (files not opened in the editor)
+    /// within `ast_cache_size`: drop the least recently used ones down to 3/4 of the
+    /// budget. Called between two build items and between two LSP messages, where no
+    /// AST is being walked (a walker holding the `Arc` of an AST keeps it alive anyway).
+    pub fn enforce_ast_budget(session: &mut SessionInfo) {
+        let Some(budget) = session.sync_odoo.config.ast_cache_size_bytes() else { return };
+        if AST_BYTES_SINCE_SCAN.load(Ordering::Relaxed) < budget / 4 {
+            return;
+        }
+        AST_BYTES_SINCE_SCAN.store(0, Ordering::Relaxed);
+        let file_mgr = session.file_mgr_mut();
+        let mut total = 0usize;
+        let mut candidates: Vec<(u64, usize, FileInfoKey)> = Vec::new();
+        for &key in file_mgr.files.values() {
+            let bytes = file_mgr.file_arena[key].evictable_bytes();
+            if bytes > 0 {
+                total += bytes;
+                candidates.push((file_mgr.file_arena[key].last_used.get(), bytes, key));
+            }
+        }
+        if total <= budget {
+            return;
+        }
+        candidates.sort_unstable_by_key(|(last_used, _, _)| *last_used);
+        let target = budget / 4 * 3;
+        let mut evicted = 0usize;
+        for (_, bytes, key) in candidates {
+            if total <= target {
+                break;
+            }
+            file_mgr.file_arena[key].evict_ast();
+            total -= bytes;
+            evicted += 1;
+        }
+        debug!("AST cache: evicted {} files, ~{} MB kept", evicted, total / (1024 * 1024));
+    }
+
+    /// Memory profiling (`OLS_MEMPROF`, see `memprof`): what the file cache holds.
+    pub fn memprof_report(&self) -> Vec<String> {
+        let (mut n, mut with_text, mut with_ast, mut text_bytes) = (0usize, 0usize, 0usize, 0usize);
+        let (mut tokens, mut index_nodes, mut stmts) = (0usize, 0usize, 0usize);
+        let mut by_ext: HashMap<String, (usize, usize)> = HashMap::default();
+        for (path, &key) in self.files.iter() {
+            n += 1;
+            let fia = &self.file_arena[key].file_info_ast;
+            let ext = Path::new(path).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+            let entry = by_ext.entry(ext).or_default();
+            entry.0 += 1;
+            if let Some(td) = fia.text_document.as_ref() {
+                with_text += 1;
+                text_bytes += td.contents().len();
+                entry.1 += td.contents().len();
+            }
+            if let Ast::PythonAst(indexed_module) = &fia.ast {
+                with_ast += 1;
+                tokens += indexed_module.parsed.tokens().len();
+                index_nodes += indexed_module.index_len();
+                stmts += indexed_module.parsed.syntax().body.len();
+            }
+        }
+        let mut lines = vec![format!("files:{n}:with_text={with_text}:with_py_ast={with_ast}:text_bytes={text_bytes}")];
+        lines.extend(by_ext.into_iter().map(|(ext, (count, bytes))| format!("files_ext:{ext}:count={count}:text_bytes={bytes}")));
+        lines.push(format!("pyast:tokens={tokens}:tok_size={}:index_nodes={index_nodes}:idx_elem={}:top_stmts={stmts}",
+            std::mem::size_of::<ruff_python_ast::token::Token>(), std::mem::size_of::<usize>() * 2));
+        lines
+    }
+
+    /// Memory profiling: drop all the Python ASTs (destructive, at the very end of a run).
+    pub fn memprof_drop_python_asts(&mut self) {
+        for file in self.file_arena.values_mut() {
+            if matches!(file.file_info_ast.ast, Ast::PythonAst(_)) {
+                file.file_info_ast.ast = Ast::Pending;
+            }
+        }
+    }
+
+    /// Memory profiling: drop all the texts (destructive, at the very end of a run).
+    pub fn memprof_drop_texts(&mut self) {
+        for file in self.file_arena.values_mut() {
+            file.file_info_ast.text_document = None;
+        }
+    }
+
+    /// Memory profiling: drop all the file infos (destructive, at the very end of a run).
+    pub fn memprof_drop_file_infos(&mut self) {
+        self.files.clear();
+        self.untitled_files.clear();
+        self.clear_file_infos();
+    }
+
+    /// Whether the file at `path` is open in the editor (without touching it, see [`Self::get_file_info`])
+    pub fn is_opened(&self, path: &str) -> bool {
+        let files = if Self::is_untitled(path) { &self.untitled_files } else { &self.files };
+        files.get(path).is_some_and(|&key| self.file_arena[key].opened)
     }
 
     pub fn iter_file_keys(&self) -> impl Iterator<Item = &FileInfoKey> {
@@ -1013,7 +1217,8 @@ impl FileMgr {
             session.file_mgr().files.get(path)
         };
         if let Some(&file) = file {
-            if session.file_mgr()[file].file_info_ast.text_document.is_none() {
+            // only the text is needed: an evicted Python AST is not rebuilt for this
+            if !session.file_mgr_mut()[file].ensure_text_document() {
                 FileInfo::prepare_ast(session, file);
             }
             return session.file_mgr()[file].text_range_to_range(range, session.sync_odoo.encoding);
@@ -1045,7 +1250,8 @@ impl FileMgr {
             session.file_mgr().files.get(path)
         };
         if let Some(&file) = file {
-            if session.file_mgr()[file].file_info_ast.text_document.is_none() {
+            // only the text is needed: an evicted Python AST is not rebuilt for this
+            if !session.file_mgr_mut()[file].ensure_text_document() {
                 FileInfo::prepare_ast(session, file);
             }
             return session.file_mgr()[file].std_range_to_range(range, session.sync_odoo.encoding);
@@ -1351,6 +1557,16 @@ pub enum PreloadedFile {
         text_document: TextDocument,
         parsed: ParsedJs,
     },
+}
+
+impl PreloadedFile {
+    /// Estimated RAM held by this payload, to bound the pre-parse cache.
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            PreloadedFile::Python { text_document, .. } => text_document.contents().len() * (1 + AST_BYTES_PER_SOURCE_BYTE),
+            PreloadedFile::DataFile { text_document, .. } | PreloadedFile::Js { text_document, .. } => text_document.contents().len(),
+        }
+    }
 }
 
 pub fn hash_text_document(text: &TextDocument) -> u64 {

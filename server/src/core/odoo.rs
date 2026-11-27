@@ -478,6 +478,7 @@ impl SyncOdoo {
                 })
             })
         };
+        crate::memprof::phase("builtins");
         if SyncOdoo::load_builtins(session) {
             session.sync_odoo.state_init = InitState::PYTHON_READY;
             SyncOdoo::build_database(session);
@@ -588,10 +589,13 @@ impl SyncOdoo {
 
     pub fn build_database(session: &mut SessionInfo) {
         session.log_message(MessageType::INFO, String::from("Building Database"));
+        crate::memprof::phase("base");
         let result = SyncOdoo::build_base(session);
         if result {
             SyncOdoo::build_modules(session);
         }
+        crate::memprof::phase("done");
+        crate::memprof::release_free_memory();
         if DEBUG_SYMBOL_TABLE_METRICS {
             log_symbol_counts(session.st());
             log_slotmap_capacities(session.st());
@@ -768,6 +772,7 @@ impl SyncOdoo {
         let mut reporter = ProgressReporterPercentage::start(session, "Odoo: Indexing modules");
 
         // Pre-parser: Start reading/parsing files in separate thread.
+        crate::memprof::phase("modules");
         let pre_parser = PreParser::new(session, &sorted_modules);
         session.sync_odoo.pre_parse_cache = Some(pre_parser.cache.clone());
 
@@ -786,7 +791,12 @@ impl SyncOdoo {
 
             // Update pre_parser on module build progress
             pre_parser.on_module_built(i);
+            // Release build slack regularly so that it does not pile up until the end.
+            if i % 64 == 63 {
+                session.sync_odoo.symbol_table.shrink_to_fit();
+            }
         }
+        session.sync_odoo.symbol_table.shrink_to_fit();
         // Module-build phase done: tear down the pool (joins workers) and drop the cache.
         session.sync_odoo.pre_parse_cache = None;
         drop(pre_parser);
@@ -794,6 +804,7 @@ impl SyncOdoo {
         // Run the held invalidations of sub functions
         BuildScheduler::hold_sub_functions_invalidations(session, false);
         SymbolTable::apply_pending_invalidations(session);
+        crate::memprof::phase("validation");
         // Drain validation queue
         let total_items = BuildScheduler::validation_queue_len(session) as u32;
         while BuildScheduler::build_one(session, main_entry, true) {
@@ -803,6 +814,9 @@ impl SyncOdoo {
             reporter.report_progress(BUILD_PHASE_WEIGHT + total_items.saturating_sub(items_left) * (VALIDATION_PHASE_WEIGHT) / total_items);
         }
         session.sync_odoo.import_cache = None;
+        let shrink_start = std::time::Instant::now();
+        session.sync_odoo.symbol_table.shrink_to_fit();
+        info!("Symbol table compacted in {} ms", shrink_start.elapsed().as_millis());
         let modules_count = session.sync_odoo.modules.len();
         reporter.end();
         info!("End building modules. {} modules loaded", modules_count);

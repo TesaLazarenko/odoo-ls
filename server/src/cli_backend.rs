@@ -180,6 +180,8 @@ impl CliBackend {
     }
 
     pub fn run(self) {
+        crate::memprof::init();
+        crate::memprof::phase("setup");
         let ws_folders = match self.setup() {
             Some(folders) => folders,
             None => return,
@@ -262,6 +264,38 @@ impl CliBackend {
                 error!("Unable to write to {}: {}", output_path, e)
             }
         }
+        Self::memprof_attribution(&mut session);
+    }
+
+    /// Memory profiling (`OLS_MEMPROF`, see `memprof`): report the symbol table and file
+    /// cache contents, then free the state part by part, recording jemalloc `allocated`
+    /// after each step. Destructive: only at the very end of a `--parse` run.
+    fn memprof_attribution(session: &mut SessionInfo) {
+        use crate::memprof::{mark, phase};
+        if std::env::var("OLS_MEMPROF").is_err() { return; }
+        phase("attribution");
+        mark("retained_after_run");
+        let report = crate::core::symbols::storage::metrics::symbol_table_report(session.st());
+        for (name, len, cap, sz) in report {
+            mark(&format!("st:{name}:len={len}:cap={cap}:elem={sz}"));
+        }
+        mark(&format!("models:{}", session.model_mgr().iter_models().count()));
+        for l in crate::core::symbols::storage::metrics::symbol_field_report(session.st()) { mark(&l); }
+        for l in session.file_mgr().memprof_report() { mark(&l); }
+        session.file_mgr_mut().memprof_drop_python_asts();
+        mark("after_drop_py_ast");
+        session.file_mgr_mut().memprof_drop_texts();
+        mark("after_drop_text");
+        session.file_mgr_mut().memprof_drop_file_infos();
+        mark("after_drop_file_infos");
+        session.sync_odoo.model_mgr.clear_models();
+        mark("after_drop_models_map");
+        let mut st = std::mem::take(&mut session.sync_odoo.symbol_table);
+        crate::core::symbols::storage::metrics::drop_slotmaps_one_by_one(&mut st, &|l| mark(l));
+        drop(st);
+        mark("after_drop_symbol_table");
+        *session.sync_odoo = SyncOdoo::new();
+        mark("after_drop_sync_odoo");
     }
 }
 

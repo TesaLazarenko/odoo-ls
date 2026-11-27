@@ -99,7 +99,9 @@ impl PythonArchBuilder {
             ModuleSymbol::load_module_arch(m, session, odoo_addons);
         }
         let (file_info_key, _) = FileMgr::get_or_recreate_file_info(session, self.file);
-        if self.file_mode && !session.file_mgr()[file_info_key].file_info_ast.ast.is_built() {
+        // Also for a function (not file mode): its body is read from the file's AST,
+        // which may have been evicted from the AST cache.
+        if !session.file_mgr()[file_info_key].file_info_ast.ast.is_built() {
             FileInfo::prepare_ast(session, file_info_key);
         }
         self.file_info = file_info_key;

@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 use ruff_text_size::{TextRange, TextSize};
 use crate::core::symbols::storage::FileContentParent;
 use crate::utils::{HashMap, HashSet};
@@ -7,7 +8,7 @@ use crate::constants::OYarn;
 use crate::core::file_mgr::NoqaInfo;
 use crate::core::model::ModelData;
 use crate::oyarn;
-use crate::core::symbols::symbol_keys::{ClassKey, SymbolKey, Wk};
+use crate::core::symbols::symbol_keys::{ClassKey, Wk};
 use crate::threads::SessionInfo;
 
 use super::symbol_mgr::{SectionRange, SymbolMgr};
@@ -31,7 +32,7 @@ pub struct ClassSymbol {
     // parent / child symbols
     parent: FileContentParent,
     //--- Body symbols
-    pub(super) symbols: HashMap<OYarn, HashMap<u32, Vec<SymbolKey>>>,
+    pub(super) symbols: HashMap<OYarn, SectionSymbols>,
 }
 
 impl ClassSymbol {

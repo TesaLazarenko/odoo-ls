@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 use crate::{core::{diagnostics::Diag, symbols::storage::FileContentParent}, utils::HashMap};
 
 use lsp_types::Diagnostic;
@@ -54,7 +55,7 @@ pub struct FunctionSymbol {
     // parent / child symbols
     parent: FileContentParent,
     //--- Body content
-    pub(super) symbols: HashMap<OYarn, HashMap<u32, Vec<SymbolKey>>>,
+    pub(super) symbols: HashMap<OYarn, SectionSymbols>,
 }
 
 impl FunctionSymbol {

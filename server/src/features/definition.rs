@@ -19,6 +19,7 @@ impl DefinitionFeature {
         line: u32,
         character: u32
     ) -> Option<GotoDefinitionResponse> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         let ast_kind = session.file_mgr()[file_info].file_info_ast.ast.kind();
         let definitions_sources = match ast_kind {
             AstKind::Pending => return None,

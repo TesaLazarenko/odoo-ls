@@ -20,6 +20,16 @@ static GLOBAL: TrackingAllocator = TrackingAllocator;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc tuning: return freed pages to the OS after ~1 s instead of the default 10 s
+/// (`dirty_decay_ms`) and skip the extra "muzzy" stage. The server frees large amounts of
+/// memory in bursts (evicted ASTs, finished build phases); with the defaults that memory
+/// stays resident long after it is freed, which adds up with several editors open.
+/// Can still be overridden at runtime with the `_RJEM_MALLOC_CONF` environment variable.
+#[cfg(all(not(debug_assertions), any(target_os = "linux", target_os = "macos")))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 fn main() {
     // Move jemalloc's purging (madivise) off the worker threads
     #[cfg(all(not(debug_assertions), any(target_os = "linux", target_os = "macos")))]
@@ -99,6 +109,7 @@ fn main() {
         let backend = CliBackend::new(cli);
         backend.run();
     } else {
+        odoo_ls_server::memprof::init();
         let mut serv = if use_debug {
             info!(tag = "test", "starting server (debug mode)");
             Server::new_tcp().expect("Unable to start tcp connection")

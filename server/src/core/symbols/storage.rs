@@ -238,3 +238,49 @@ impl SymbolTable {
         self.assert_no_orphans_in_js_files();
     }
 }
+
+impl SymbolTable {
+    /// Release the spare capacity of the per-symbol vectors and maps. Building pushes
+    /// into `Vec`s that grow by doubling (an evaluation list of 1 element has room for
+    /// 4) and maps that keep their high-water mark; on Odoo 20.0 that slack was over
+    /// 100 MB. Called after build phases; O(number of symbols), no reallocation when
+    /// a container is already tight.
+    pub fn shrink_to_fit(&mut self) {
+        fn shrink_sections(sections: &mut Vec<symbol_mgr::SectionRange>) {
+            sections.shrink_to_fit();
+        }
+        fn shrink_symbols(symbols: &mut crate::utils::HashMap<OYarn, symbol_mgr::SectionSymbols>) {
+            for v in symbols.values_mut() {
+                v.shrink_to_fit();
+            }
+            symbols.shrink_to_fit();
+        }
+        for v in self.variables.values_mut() {
+            v.evaluations.shrink_to_fit();
+        }
+        for f in self.functions.values_mut() {
+            f.evaluations.shrink_to_fit();
+            f.args.shrink_to_fit();
+            f.diagnostics.shrink_to_fit();
+            shrink_sections(&mut f.sections);
+            shrink_symbols(&mut f.symbols);
+        }
+        for c in self.classes.values_mut() {
+            c.bases.shrink_to_fit();
+            shrink_sections(&mut c.sections);
+            shrink_symbols(&mut c.symbols);
+        }
+        for f in self.files.values_mut() {
+            shrink_sections(&mut f.sections);
+            shrink_symbols(&mut f.symbols);
+        }
+        for m in self.modules.values_mut() {
+            shrink_sections(&mut m.sections);
+            shrink_symbols(&mut m.symbols);
+        }
+        for p in self.python_packages.values_mut() {
+            shrink_sections(&mut p.sections);
+            shrink_symbols(&mut p.symbols);
+        }
+    }
+}

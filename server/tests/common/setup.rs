@@ -41,6 +41,11 @@ pub fn setup_server(with_odoo: bool) -> (SyncOdoo, ConfigEntry) {
     };
     config.set_str(ConfigKey::PythonPath, python_cmd);
     config.set_str(ConfigKey::DiagMissingImports, S!("all"));
+    // Lets the whole suite run with a tiny AST/text cache budget (e.g. 1 MB), so that
+    // every flow is exercised with ASTs evicted and rebuilt from disk.
+    if let Ok(size) = env::var("OLS_TEST_AST_CACHE_SIZE") {
+        config.set_u64(ConfigKey::AstCacheSize, size.parse().expect("OLS_TEST_AST_CACHE_SIZE must be a number of MB"));
+    }
     (server, config)
 }
 

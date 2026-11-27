@@ -21,7 +21,7 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use std::cmp::{max, min};
-use crate::utils::{HashMap, HashSet};
+use crate::utils::HashSet;
 
 use super::file_mgr::FileMgr;
 use super::symbols::function_symbol::{Argument, ArgumentType};
@@ -490,7 +490,7 @@ impl Evaluation {
     /// else:
     ///     i="test"
     /// It will return two evaluation for i, one with 5 and one for "test"
-    pub fn from_sections(symbol_table: &SymbolTable, parent_key: SymbolKey, sections: &HashMap<u32, Vec<SymbolKey>>) -> Vec<Evaluation> {
+    pub fn from_sections(symbol_table: &SymbolTable, parent_key: SymbolKey, sections: &crate::core::symbols::storage::symbol_mgr::SectionSymbols) -> Vec<Evaluation> {
         let parent_sym_mgr = symbol_table.as_symbol_mgr(parent_key);
         let mut res = vec![];
         let section = parent_sym_mgr.get_section_for(u32::MAX);

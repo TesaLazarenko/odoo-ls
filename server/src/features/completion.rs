@@ -65,6 +65,7 @@ impl CompletionFeature {
         line: u32,
         character: u32
     ) -> Option<CompletionResponse> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         let offset = session.file_mgr()[file_info].position_to_offset(line, character, session.sync_odoo.encoding);
         let py_ast = session.file_mgr()[file_info].file_info_ast.ast.as_py_ast().cloned()?;
         let ast = py_ast.get_stmts();

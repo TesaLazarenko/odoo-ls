@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 use crate::core::file_mgr::NoqaInfo;
 use crate::core::symbols::SymbolTable;
 use crate::core::symbols::storage::dependency_mgr::{DependenciesTable, DependentsTable};
@@ -42,7 +43,7 @@ pub struct ModuleSymbol {
 
     // parent / child symbols
     parent: NamespaceKey,
-    pub(super) symbols: HashMap<OYarn, HashMap<u32, Vec<SymbolKey>>>,
+    pub(super) symbols: HashMap<OYarn, SectionSymbols>,
     pub(super) fs_symbols: HashMap<OYarn, SymbolKey>,
     pub(super) data_file_symbols: HashMap<String, SourceFileKey>,
     pub(super) js_symbols: HashMap<String, JsFileKey>,

@@ -1,9 +1,10 @@
+use crate::core::file_mgr::FileMgr;
 use std::{path::Path, sync::atomic::Ordering};
 
 use lsp_types::MessageType;
 use tracing::{error, info, trace};
 
-use crate::{S, constants::{BuildStatus, BuildSteps, DEBUG_REBUILD_NOW, DEBUG_STEPS, DEBUG_THREADS, MAX_WATCHED_FILES_UPDATES_BEFORE_RESTART}, core::{csv_validation::CsvValidator, entry_point::EntryPointKey, import_resolver::ImportCache, js_validator::JsValidator, odoo::{InitState, OdooNotification}, python_arch_builder::PythonArchBuilder, python_arch_eval::PythonArchEval, python_validator::PythonValidator, symbols::{SymbolTable, symbol_keys::{BuildableSymbolKey, SymbolKey}, symbol_table_impl::{CreateError, PendingInvalidations}}, xml_validation::XmlValidator}, fifo_ptr_weak_hash_set::FifoWeakHashSet, progress_reporter::ProgressReporterRemaining, threads::SessionInfo, tree::Tree, utils::HashSet};
+use crate::{S, constants::{BuildStatus, BuildSteps, DEBUG_REBUILD_NOW, DEBUG_STEPS, DEBUG_THREADS, MAX_WATCHED_FILES_UPDATES_BEFORE_RESTART}, core::{csv_validation::CsvValidator, entry_point::{EntryPointKey, EntryPointType}, import_resolver::ImportCache, js_validator::JsValidator, odoo::{InitState, OdooNotification}, python_arch_builder::PythonArchBuilder, python_arch_eval::PythonArchEval, python_validator::PythonValidator, symbols::{SymbolTable, symbol_keys::{BuildableSymbolKey, SymbolKey}, symbol_table_impl::{CreateError, PendingInvalidations}}, xml_validation::XmlValidator}, fifo_ptr_weak_hash_set::FifoWeakHashSet, progress_reporter::ProgressReporterRemaining, threads::SessionInfo, tree::Tree, utils::HashSet};
 
 #[derive(Debug, Clone)]
 pub struct BuildScheduler {
@@ -69,6 +70,7 @@ impl BuildScheduler {
     /// Returns true if an item was built, false if all queues are empty.
     pub fn build_one(session: &mut SessionInfo, entry: EntryPointKey, validation: bool) -> bool {
         // nothing is being built between two items
+        FileMgr::enforce_ast_budget(session);
         SymbolTable::apply_pending_invalidations(session);
         Self::defer_invalidations(session, |session| Self::build_one_impl(session, entry, validation))
     }
@@ -169,6 +171,15 @@ impl BuildScheduler {
             BuildSteps::ARCH => bs!(session).rebuild_arch.insert(symbol),
             BuildSteps::ARCH_EVAL => bs!(session).rebuild_arch_eval.insert(symbol),
             BuildSteps::VALIDATION => {
+                if Self::skips_validation(session, symbol) {
+                    // Its functions are still built: their ARCH_EVAL injects the attributes they assign
+                    // (`self.x = ...`) into the classes, which the other files see (ext symbols).
+                    for function in session.st().iter_inner_functions(symbol.into()) {
+                        Self::queue_function(session, function.into());
+                    }
+                    session.st_mut().set_build_status(symbol, BuildSteps::VALIDATION, BuildStatus::DONE);
+                    return;
+                }
                 bs!(session).rebuild_validation.insert(symbol);
                 Self::queue_functions(session, symbol);
             }
@@ -184,6 +195,30 @@ impl BuildScheduler {
             BuildSteps::ARCH_EVAL => bs!(session).rebuild_arch_eval.contains(&symbol),
             BuildSteps::VALIDATION => bs!(session).rebuild_validation.contains(&symbol),
         }
+    }
+
+    /// Python sources outside the workspace and not open in the editor are not
+    /// validated (their functions are still built, see [`Self::queue`]): the only product
+    /// of the validation of a file is diagnostics (see [`Self::pop_item`]),
+    /// and the diagnostics of such files are never published. On a project made of
+    /// custom modules over Odoo, this was validating all of Odoo (most of the indexing
+    /// time) for nothing, and kept the evaluations it computed in memory.
+    fn skips_validation(session: &SessionInfo, symbol: BuildableSymbolKey) -> bool {
+        let Some(file) = symbol.as_source_file_key() else { return false };
+        if !matches!(symbol, BuildableSymbolKey::File(_) | BuildableSymbolKey::Module(_) | BuildableSymbolKey::PythonPackage(_)) {
+            return false;
+        }
+        if session.st().in_workspace(file.into()) {
+            return false;
+        }
+        // Only Odoo itself and the addons paths: files of custom, builtin and public
+        // entries keep the previous behaviour (their validation also forces deferred
+        // builds that some flows rely on).
+        let (_, entry) = session.st().get_tree_and_entry(file.into());
+        if !matches!(session.ep_mgr()[entry].typ(), EntryPointType::MAIN | EntryPointType::ADDON) {
+            return false;
+        }
+        !session.file_mgr().is_opened(session.st().file_path(file))
     }
 
     pub fn get_rebuild_queue_size(session: &mut SessionInfo) -> usize {
@@ -333,6 +368,7 @@ impl BuildScheduler {
                 }
                 return false;
             }
+            FileMgr::enforce_ast_budget(session);
             let sym = BuildScheduler::pop_item(session, BuildSteps::ARCH);
             if let Some(sym_key) = sym {
                 if DEBUG_STEPS {

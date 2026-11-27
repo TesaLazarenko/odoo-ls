@@ -463,6 +463,11 @@ pub fn message_processor_thread_main(sync_odoo: Arc<Mutex<SyncOdoo>>,
         }
         // Process buffered messages
         if let Some(msg) = buffer.pop_front() {
+            // Between two messages nothing is borrowed: keep cached ASTs within budget.
+            {
+                let mut session = create_session!(sender_to_s, receiver_to_s, Some(generic_sender_to_main.clone()), sync_odoo, delayed_process_sender);
+                FileMgr::enforce_ast_budget(&mut session);
+            }
             match msg {
                 ThreadMessage::LSPMessage(Message::Request(r)) => {
                     sync_odoo.lock().unwrap().current_request_id = Some(r.id.clone());

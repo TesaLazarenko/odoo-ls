@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 use std::{
     collections::{VecDeque, hash_map}, path::Path, sync::atomic::{AtomicU64, Ordering},
 };
@@ -608,7 +609,7 @@ impl SymbolTable {
         }
     }
 
-    pub fn iter_symbols(&self, target: SymbolKey) -> hash_map::Iter<'_, OYarn, HashMap<u32, Vec<SymbolKey>>> {
+    pub fn iter_symbols(&self, target: SymbolKey) -> hash_map::Iter<'_, OYarn, SectionSymbols> {
         match target {
             SymbolKey::File(f) => {
                 self[f].symbols().iter()
@@ -1005,7 +1006,7 @@ impl SymbolTable {
     }
 
     ///given all the sections of a symbol and a position, return all the Symbols that can represent the symbol
-    pub fn get_loc_symbol(&self, target: &dyn SymbolMgr, map: &HashMap<u32, Vec<SymbolKey>>, position: u32, index: &SectionIndex, acc: &mut HashSet<u32>) -> ContentSymbols {
+    pub fn get_loc_symbol(&self, target: &dyn SymbolMgr, map: &SectionSymbols, position: u32, index: &SectionIndex, acc: &mut HashSet<u32>) -> ContentSymbols {
         let mut res = ContentSymbols::default();
         match index {
                 SectionIndex::NONE => { return res; },

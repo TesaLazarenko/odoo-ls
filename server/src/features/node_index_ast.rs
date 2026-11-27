@@ -202,6 +202,8 @@ pub struct IndexedModule {
 }
 
 impl IndexedModule {
+    /// Number of indexed nodes (memory reports).
+    pub fn index_len(&self) -> usize { self.index.len() }
     /// Create a new [`IndexedModule`] from the given AST.
     #[allow(clippy::unnecessary_cast)]
     pub fn new(parsed: Parsed<ModModule>) -> Arc<Self> {

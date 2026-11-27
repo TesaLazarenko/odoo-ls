@@ -1,3 +1,4 @@
+use crate::core::symbols::storage::symbol_mgr::SectionSymbols;
 
 use crate::{constants::{BuildStatus, BuildSteps, OYarn}, core::{file_mgr::NoqaInfo, symbols::{storage::{FileSystemSymbolParent, dependency_mgr::{DependenciesTable, DependentsTable}}, symbol_keys::SymbolKey}}, oyarn, utils::PathSanitizer};
 use std::path::Path;
@@ -27,7 +28,7 @@ pub struct PythonPackageSymbol {
 
     // parent / child symbols
     parent: FileSystemSymbolParent,
-    pub(super) symbols: HashMap<OYarn, HashMap<u32, Vec<SymbolKey>>>,
+    pub(super) symbols: HashMap<OYarn, SectionSymbols>,
     pub(super) fs_symbols: HashMap<OYarn, SymbolKey>,
 }
 

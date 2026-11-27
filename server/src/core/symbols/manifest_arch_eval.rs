@@ -58,6 +58,7 @@ impl ModuleSymbol {
                     .expect("path should not already exist, as checked above");
                 Self::on_data_file_load(&session.sync_odoo.symbol_table, &mut session.sync_odoo.entry_point_mgr, csv_sym.into());
                 session.st_mut().add_dependency(symbol_key.into(), csv_sym.into(), BuildSteps::ARCH_EVAL, BuildSteps::ARCH);
+                session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
                 let Some(data) = session.file_mgr()[file_info].file_info_ast.text_document.as_ref().map(|td| td.contents().to_string()) else {
                     // File can be invalid (not valid UTF-8 and so text_document is empty)
                     continue;
@@ -164,6 +165,7 @@ impl ModuleSymbol {
             session.st_mut().add_dependency(module.into(), xml_sym.into(), BuildSteps::ARCH_EVAL, BuildSteps::ARCH);
             let (_, file_info) = FileMgr::update_file_info(session, file_path_str.as_ref(), None, None, false); //create ast if not in cache
             FileInfo::publish_diagnostics(session, file_info);
+            session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
             if session.file_mgr()[file_info].file_info_ast.text_document.as_ref().is_none() { // File can be invalid (not valid UTF-8 and so text_document is empty)
                 continue;
             }
@@ -172,6 +174,7 @@ impl ModuleSymbol {
     }
 
     fn load_xml_arch(session: &mut SessionInfo, xml_sym: XmlFileKey, file_info: FileInfoKey, web_asset: bool) {
+        session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
         let Some(data) = session.file_mgr()[file_info].file_info_ast.text_document.as_ref().map(|td| td.contents().to_string()) else {
             // File can be invalid (not valid UTF-8 and so text_document is empty)
             return;

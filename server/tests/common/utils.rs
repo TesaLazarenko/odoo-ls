@@ -105,6 +105,8 @@ pub fn get_resolved_symbols_at_position(
     line: u32,
     character: u32,
 ) -> Vec<SymbolKey> {
+    // Like the feature entry points: rebuild an AST evicted from the AST cache.
+    odoo_ls_server::core::file_mgr::FileMgr::ensure_ast(session, file_info);
     // Get evaluations at the given position
     let offset = session.file_mgr()[file_info]
         .position_to_offset(line, character, session.sync_odoo.encoding);

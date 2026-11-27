@@ -118,6 +118,7 @@ impl SemanticTokensFeature {
     }
 
     pub fn tokens_python(session: &mut SessionInfo, file_symbol: SourceFileKey, file_info: FileInfoKey) -> SemanticTokens {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         // Raw, unsorted tokens: (range, token type index, modifier bitset). We
         // collect first, then sort by (line, char) and delta-encode at the end.
         let mut raw: Vec<(Range, u32, u32)> = vec![];
@@ -151,6 +152,7 @@ impl SemanticTokensFeature {
         let mut raw: Vec<(Range, u32, u32)> = Self::template_ref_tokens(session, file_info);
 
         // Borrow only the `file_mgr` field, so the bridge call below can borrow `tsserver_bridge` mutably
+        session.sync_odoo.file_mgr[file_info].ensure_text_document(); // may have been evicted from the cache
         let content = session.sync_odoo.file_mgr[file_info].file_info_ast.text_document.as_ref().map(|td| td.contents());
 
         // 2. tsserver's classifier. Without a bridge (CLI / most tests) we keep only the

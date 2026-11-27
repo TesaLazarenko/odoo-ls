@@ -112,6 +112,10 @@ impl PythonValidator {
                 let Some(parent_file) = session.st().get_file(symbol) else {
                     panic!("Parent file not found on validating function")
                 };
+                // Reload an evicted AST first: an evicted file has text_hash 0.
+                if !session.file_mgr()[file_info_key].file_info_ast.ast.is_built() {
+                    FileInfo::prepare_ast(session, file_info_key);
+                }
                 let text_hash = session.file_mgr()[file_info_key].file_info_ast.text_hash;
                 if text_hash != session.st_mut().get_processed_text_hash(parent_file) {
                     session.st_mut().set_build_status(symbol.unwrap_buildable_key(), BuildSteps::VALIDATION, BuildStatus::INVALID);

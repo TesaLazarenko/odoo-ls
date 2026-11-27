@@ -25,6 +25,7 @@ pub enum ConfigKey {
     AdditionalStubsMerge,
     AdditionalLanguages,
     FileCache,
+    AstCacheSize,
     DiagMissingImports,
     AcFilterModelNames,
     AutoRefreshDelay,
@@ -87,6 +88,10 @@ pub(super) fn specs() -> Vec<FieldSpec> {
         FieldSpec::new(AdditionalLanguages, "additional_languages", StrList)
             .stage(PostMergeProcessing, stages::expand_languages),
         FieldSpec::new(FileCache, "file_cache", Bool).default(ConfigValue::bool(true)),
+        // Budget, in MB, for parsed Python ASTs and source texts kept in RAM for files
+        // that are not open in the editor. Least recently used ones are dropped beyond it
+        // and re-read/re-parsed from disk on demand. 0 keeps everything (legacy behaviour).
+        FieldSpec::new(AstCacheSize, "ast_cache_size", U64).default(ConfigValue::u64(64)),
         FieldSpec::new(DiagMissingImports, "diag_missing_imports", DiagImportsMode)
             .default(ConfigValue::str("all")),
         FieldSpec::new(AcFilterModelNames, "ac_filter_model_names", Bool)

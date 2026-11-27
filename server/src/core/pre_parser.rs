@@ -40,6 +40,11 @@ use crate::utils::{HashMap, PathSanitizer};
 /// stay *ahead* of the build thread; past that they merely compete with it for cores,
 /// and the build thread is the critical path.
 const MAX_PRE_PARSE_WORKERS: usize = 4;
+/// Upper bound on the estimated RAM of pre-parsed payloads waiting for the build thread.
+/// Without it, the workers (several, vs. one build thread) run arbitrarily far ahead and
+/// the cache held the ASTs of many upcoming modules at once: on Odoo 20.0 that was the
+/// peak of the whole indexing. Workers wait while the cache is above it.
+const MAX_PRE_PARSE_CACHE_BYTES: usize = 96 * 1024 * 1024;
 
 /// Number of worker threads parsing files ahead of the build, sized to the machine.
 ///
@@ -93,12 +98,21 @@ pub struct PreParseCache {
     /// Counters for end-of-build instrumentation. Inert unless
     /// [`DEBUG_PRE_PARSER`] is set; see [`PreParseStats`].
     stats: PreParseStats,
+    /// Estimated RAM of the payloads in `index` (see [`PreloadedFile::estimated_bytes`]).
+    bytes: AtomicUsize,
 }
 
 impl PreParseCache {
+    fn is_full(&self) -> bool {
+        self.bytes.load(Ordering::Relaxed) > MAX_PRE_PARSE_CACHE_BYTES
+    }
+
     /// Remove and return the prepared payload for `path`, if a worker produced one.
     pub fn take(&self, path: &str) -> Option<PreloadedFile> {
         let pre_loaded = self.index.lock().unwrap().files_by_path.remove(path);
+        if let Some(p) = &pre_loaded {
+            self.bytes.fetch_sub(p.estimated_bytes(), Ordering::Relaxed);
+        }
         self.stats.record_lookup(pre_loaded.is_some());
         pre_loaded
     }
@@ -128,9 +142,15 @@ impl PreParseCache {
     fn evict_entries(&self, module_idx: usize) {
         let mut index = self.index.lock().unwrap();
         let before = index.files_by_path.len(); // for stats
-        if let Some(paths) = index.paths_by_module_idx.remove(&module_idx) {
+        // Also modules before `module_idx`: a late worker may have inserted entries
+        // for a module after it was built; they can no longer be hits.
+        let done: Vec<usize> = index.paths_by_module_idx.keys().copied().filter(|&i| i <= module_idx).collect();
+        for idx in done {
+            let paths = index.paths_by_module_idx.remove(&idx).unwrap_or_default();
             for path in paths {
-                index.files_by_path.remove(&path);
+                if let Some(p) = index.files_by_path.remove(&path) {
+                    self.bytes.fetch_sub(p.estimated_bytes(), Ordering::Relaxed);
+                }
             }
         }
         self.stats.record_evicted(before - index.files_by_path.len());
@@ -138,7 +158,10 @@ impl PreParseCache {
 
     fn insert(&self, module_idx: usize, path: String, file: PreloadedFile) {
         let mut index = self.index.lock().unwrap();
-        index.files_by_path.insert(path.clone(), file);
+        self.bytes.fetch_add(file.estimated_bytes(), Ordering::Relaxed);
+        if let Some(old) = index.files_by_path.insert(path.clone(), file) {
+            self.bytes.fetch_sub(old.estimated_bytes(), Ordering::Relaxed);
+        }
         index.paths_by_module_idx.entry(module_idx).or_default().push(path);
         self.stats.record_insert(index.files_by_path.len());
     }
@@ -193,6 +216,14 @@ impl PreParser {
                 .spawn(move || {
                     loop {
                         if terminate.load(Ordering::Relaxed) { return; }
+                        // Bounded read-ahead: wait for the build thread to consume.
+                        if ctx.cache.is_full() {
+                            if job_queue.lock().unwrap().is_empty() {
+                                return; // build over (the queue is cleared on drop)
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
                         // Hold the lock only long enough to pull one job, then release
                         // it so a sibling worker can pull while this one parses.
                         let Some(job) = job_queue.lock().unwrap().pop_front() else {

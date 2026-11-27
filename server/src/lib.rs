@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod memprof;
 pub mod args;
 pub mod cli_backend;
 pub mod constants;

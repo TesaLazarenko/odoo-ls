@@ -266,6 +266,7 @@ pub fn semantic_tokens_xml(session: &mut SessionInfo, file_info: FileInfoKey) ->
     let mut raw_tokens: Vec<(Range, u32, u32)> = vec![];
 
     // 1. Template-name tokens. Independent of tsserver: we only need to parse the XML.
+    session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
     let xml = session.file_mgr()[file_info].file_info_ast.text_document.as_ref().map(|td| td.contents());
     if let Some(xml) = xml && let Ok(document) = roxmltree::Document::parse(xml)
     {
@@ -558,6 +559,7 @@ pub(crate) fn map_virtual_ref(
 pub(crate) fn build_virtual_docs(session: &mut SessionInfo, file_info: FileInfoKey) -> Vec<OwlVirtualDoc> {
     // 1. XML content.
     let xml = {
+        session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
         let fi = &session.file_mgr()[file_info];
         let fia = &fi.file_info_ast;
         match fia.text_document.as_ref() {
@@ -936,6 +938,7 @@ fn shim_module_specifier(real_js_path: &str) -> String {
 pub(crate) fn read_real_js(session: &mut SessionInfo, file_path: &str) -> Option<String> {
     let file_info = session.file_mgr().get_file_info(file_path);
     if let Some(file_info) = file_info {
+        session.file_mgr_mut()[file_info].ensure_text_document(); // may have been evicted from the cache
         let fi = &session.file_mgr()[file_info];
         let fia = &fi.file_info_ast;
         if let Some(td) = fia.text_document.as_ref() {

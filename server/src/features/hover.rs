@@ -14,6 +14,7 @@ pub struct HoverFeature {}
 impl HoverFeature {
 
     pub fn hover_python(session: &mut SessionInfo, file_symbol: SourceFileKey, file_info: FileInfoKey, line: u32, character: u32) -> Option<Hover> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         let offset = session.file_mgr()[file_info].position_to_offset(line, character, session.sync_odoo.encoding);
         let py_ast = session.file_mgr()[file_info].file_info_ast.ast.as_py_ast().cloned()?;
         let (analyse_ast_result, range, _expr, call_expr) = AstUtils::get_symbols(session, &py_ast, file_symbol, offset as u32);
@@ -39,6 +40,7 @@ impl HoverFeature {
     }
 
     pub fn hover_xml(session: &mut SessionInfo, file_symbol: SourceFileKey, file_info: FileInfoKey, line: u32, character: u32) -> Option<Hover> {
+        crate::core::file_mgr::FileMgr::ensure_ast(session, file_info);
         let offset = session.file_mgr()[file_info].position_to_offset(line, character, session.sync_odoo.encoding);
         let data = session.file_mgr()[file_info].file_info_ast.text_document.as_ref()?.contents().to_string();
         let document = match roxmltree::Document::parse(&data) {

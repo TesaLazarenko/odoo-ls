@@ -162,6 +162,13 @@ impl ConfigEntry {
     pub fn file_cache(&self) -> bool {
         self.as_bool(ConfigKey::FileCache)
     }
+    /// RAM budget for not-opened files' ASTs and texts, in bytes; `None` = unbounded.
+    pub fn ast_cache_size_bytes(&self) -> Option<usize> {
+        match self.as_u64(ConfigKey::AstCacheSize) {
+            0 => None,
+            mb => Some((mb as usize).saturating_mul(1024 * 1024)),
+        }
+    }
     pub fn ac_filter_model_names(&self) -> bool {
         self.as_bool(ConfigKey::AcFilterModelNames)
     }
