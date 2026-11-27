@@ -1,40 +1,21 @@
 use std::path::Path;
 
-use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
-use odoo_ls_server::{S, utils::PathSanitizer};
+use lsp_types::DiagnosticSeverity;
+use odoo_ls_server::{threads::SessionInfo, utils::PathSanitizer};
 
-use crate::{setup::setup::*, test_utils::{diag_on_line, verify_diagnostics_against_doc}};
+use crate::common::*;
 
-#[test]
-fn test_ols05000_2_3_py_file() {
-    let (mut odoo, config) = setup_server(true);
-    let mut session = create_init_session(&mut odoo, config);
+pub fn test_ols05000_2_3_py_file(mut session: SessionInfo) {
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let bikes_py_path = test_addons_path.join("module_for_diagnostics").join("models").join("bike_parts_wheel.py");
     assert!(Path::new(&bikes_py_path).exists(), "Test file does not exist: {}", bikes_py_path.display());
-    let bikes_py_diagnostics = get_diagnostics_for_path(&mut session, &bikes_py_path.sanitize());
-    let doc_diags = get_diagnostics_test_comments(&mut session, &bikes_py_path.sanitize());
+    let bikes_py_path_str = bikes_py_path.sanitize();
+    let bikes_py_diagnostics = get_diagnostics_for_path(&mut session, &bikes_py_path_str);
+    let doc_diags = get_diagnostics_test_comments(&mut session, &bikes_py_path_str);
     verify_diagnostics_against_doc(&bikes_py_diagnostics, &doc_diags); // OLS05002 & OLS05003 & OLS05051
 }
 
-fn check_xml_diagnostic(diagnostics: &[Diagnostic], ols_code: &str, line: u32, severity: DiagnosticSeverity) {
-    let line_diagnostics = diag_on_line(diagnostics, line);
-    assert_eq!(line_diagnostics.len(), 1);
-    let diag = &line_diagnostics[0];
-    assert!(diag.code.is_some());
-    let code = match &diag.code {
-        Some(NumberOrString::String(code)) => code,
-        Some(NumberOrString::Number(num)) => panic!("Unexpected numeric code: {}", num),
-        None => panic!("Diagnostic code is None"),
-    };
-    assert!(code == &S!(ols_code));
-    assert!(diag.severity.is_some_and(|s| s == severity));
-}
-
-#[test]
-fn test_ols05000s_xml_file() {
-    let (mut odoo, config) = setup_server(true);
-    let mut session = create_init_session(&mut odoo, config);
+pub fn test_ols05000s_xml_file(mut session: SessionInfo) {
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let bikes_xml_path = test_addons_path.join("module_for_diagnostics").join("data").join("bikes.xml");
     assert!(Path::new(&bikes_xml_path).exists(), "Test file does not exist: {}", bikes_xml_path.display());
@@ -114,10 +95,7 @@ fn test_ols05000s_xml_file() {
     assert!(diag_on_line(&bikes_xml_diagnostics, 127).is_empty());
 }
 
-#[test]
-fn test_ols05000s_manifest() {
-    let (mut odoo, config) = setup_server(true);
-    let mut session = create_init_session(&mut odoo, config);
+pub fn test_ols05000s_manifest(mut session: SessionInfo) {
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let bikes_py_path = test_addons_path.join("module_for_diagnostics").join("__manifest__.py");
     assert!(Path::new(&bikes_py_path).exists(), "Test file does not exist: {}", bikes_py_path.display());

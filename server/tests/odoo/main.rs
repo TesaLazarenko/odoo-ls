@@ -1,0 +1,145 @@
+#[path = "../common/mod.rs"]
+mod common;
+
+mod test_inherits_of_mixin;
+mod test_object_members;
+mod test_xml_id_completion;
+mod self_propagation_tests;
+mod test_arch_eval_hooks;
+mod test_completion;
+mod test_controller;
+mod test_env_attributes;
+mod test_env_subscript;
+mod test_get_symbol;
+mod test_hooks;
+mod test_language;
+mod test_ls;
+mod test_module_lifecycle;
+mod test_references;
+mod test_semantic_tokens;
+mod test_start_server;
+mod test_xml_fields;
+
+use crate::{
+    common::{build_once_run_isolated, setup_server},
+    self_propagation_tests::test_self_propagation,
+    test_arch_eval_hooks::{
+        test_base_model_env_hook, test_ids_and_id_field_hooks, test_ir_rule_global_field_hook,
+        test_odoo_init_symbol_hooks, test_registry_hooks, test_relational_field_get_hooks,
+        test_relational_field_hover_shows_comodel, test_scalar_field_get_hooks, test_self_returning_chain_hooks,
+    },
+    test_completion::{
+        test_compute_sql_kwarg_method_completion, test_depends_kwarg_nested_field_completion,
+        test_domain_operator_completion, test_import_completion_with_normalized_name,
+        test_init_storage_kwarg_method_completion, test_lambda_is_not_a_member, test_list_element_completion,
+        test_magic_field_comodel_completion, test_selection_field_method_completion,
+        test_ext_symbols_completion, test_call_argument_completion, test_order_completion_with_escape, test_order_completion_by_word, test_order_kwarg_completion, test_order_completion_annotated, test_order_completion_outside_model, test_object_members_completion,
+    },
+    test_controller::{test_request_env_definition, test_request_env_subscript, test_request_type_hover},
+    test_env_attributes::{test_env_attributes_resolve, test_env_user_through_variable_resolves},
+    test_env_subscript::test_env_subscript_after_getitem_invalidation,
+    test_get_symbol::{
+        test_csv_quoted_commas, test_csv_ranges_quoted_crlf, test_csv_ranges_quoted_lf, test_csv_ranges_unquoted_crlf,
+        test_csv_ranges_unquoted_lf, test_definition, test_definition_csv,
+        test_hover_inverse_name_o2m, test_hover_on_model_field_and_method, test_hover_on_namespace_and_module,
+        test_lambda_parameter_scoping, test_model_subscription, test_xml_definition, test_xml_hover,
+    },
+    test_hooks::test_search_eval_hook,
+    test_language::{
+        test_config_additional_languages_updates_diagnostics, test_language_validation,
+        test_no_false_positives_from_res_lang_csv,
+    },
+    test_ls::{test_import_found_again_after_rename, test_imports_after_dependency_edit, test_structure},
+    test_xml_fields::{test_xml_fields_def_hover_completion, test_xml_fields_diagnostics},
+    test_references::test_references,
+    test_semantic_tokens::test_semantic_tokens_python,
+};
+
+#[test]
+fn test_arch_eval_hooks() {
+    let (odoo, config) = setup_server(true);
+    build_once_run_isolated(odoo, config, &[
+        &test_self_returning_chain_hooks,
+        &test_registry_hooks,
+        &test_ids_and_id_field_hooks,
+        &test_odoo_init_symbol_hooks,
+        &test_ir_rule_global_field_hook,
+        &test_base_model_env_hook,
+        &test_scalar_field_get_hooks,
+        &test_relational_field_get_hooks,
+        &test_relational_field_hover_shows_comodel,
+        &test_search_eval_hook,
+        &test_env_attributes_resolve,
+        &test_env_user_through_variable_resolves,
+        &|mut s| test_request_type_hover(&mut s),
+        &|mut s| test_request_env_definition(&mut s),
+        &|mut s| test_request_env_subscript(&mut s),
+        &test_env_subscript_after_getitem_invalidation,
+    ]);
+}
+
+#[test]
+fn test_get_symbol() {
+    let (odoo, config) = setup_server(true);
+    build_once_run_isolated(odoo, config, &[
+        &test_structure,
+        &test_imports_after_dependency_edit,
+        &test_import_found_again_after_rename,
+        &test_hover_on_model_field_and_method,
+        &test_hover_inverse_name_o2m,
+        &test_hover_on_namespace_and_module,
+        &test_definition_csv,
+        &test_model_subscription,
+        &test_self_propagation,
+        &test_lambda_parameter_scoping,
+        &test_csv_quoted_commas,
+        &|mut s| test_csv_ranges_unquoted_lf(&mut s),
+        &|mut s| test_csv_ranges_quoted_lf(&mut s),
+        &|mut s| test_csv_ranges_unquoted_crlf(&mut s),
+        &|mut s| test_csv_ranges_quoted_crlf(&mut s),
+        &test_xml_hover,
+        &test_xml_definition,
+        &test_definition,
+    ]);
+}
+
+#[test]
+fn test_xml() {
+    let (odoo, config) = setup_server(true);
+    build_once_run_isolated(odoo, config, &[
+        // languages for validation in xml
+        &test_no_false_positives_from_res_lang_csv,
+        &test_config_additional_languages_updates_diagnostics,
+        &test_language_validation,
+        // xml fields
+        &test_xml_fields_diagnostics,
+        &test_xml_fields_def_hover_completion,
+    ]);
+}
+    
+#[test]
+fn test_features() {
+    let (odoo, config) = setup_server(true);
+    build_once_run_isolated(odoo, config, &[
+        &test_references,
+        &test_semantic_tokens_python,
+        // completion
+        &|mut s| test_depends_kwarg_nested_field_completion(&mut s),
+        &|mut s| test_list_element_completion(&mut s),
+        &|mut s| test_selection_field_method_completion(&mut s),
+        &|mut s| test_magic_field_comodel_completion(&mut s),
+        &|mut s| test_import_completion_with_normalized_name(&mut s),
+        &|mut s| test_compute_sql_kwarg_method_completion(&mut s),
+        &|mut s| test_domain_operator_completion(&mut s),
+        &|mut s| test_init_storage_kwarg_method_completion(&mut s),
+        &|mut s| test_lambda_is_not_a_member(&mut s),
+        &|mut s| test_ext_symbols_completion(&mut s),
+        &|mut s| test_call_argument_completion(&mut s),
+        &|mut s| test_order_completion_with_escape(&mut s),
+        &|mut s| test_order_completion_by_word(&mut s),
+        &|mut s| test_order_kwarg_completion(&mut s),
+        &|mut s| test_order_completion_annotated(&mut s),
+        &|mut s| test_order_completion_outside_model(&mut s),
+        &|mut s| test_object_members_completion(&mut s),
+    ]);
+}

@@ -1,0 +1,271 @@
+// Test CSV diagnostics: field count mismatches, parsing errors, and xml_id format validation
+
+use lsp_types::Diagnostic;
+use odoo_ls_server::threads::SessionInfo;
+use odoo_ls_server::utils::PathSanitizer;
+use odoo_ls_server::utils::HashMap;
+use std::env;
+use std::path::Path;
+
+use crate::common;
+
+fn csv_test_paths() -> (String, String, String, String, String, String, String) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+
+    let field_mismatch = test_addons_path
+        .join("module_csv").join("data").join("csv_field_mismatch").join("res.country.state.csv")
+        .sanitize();
+    let invalid_xml_id = test_addons_path
+        .join("module_csv").join("data").join("csv_invalid_xml_id").join("res.country.state.csv")
+        .sanitize();
+    let duplicate_column = test_addons_path
+        .join("module_csv").join("data").join("csv_duplicate_column").join("res.country.state.csv")
+        .sanitize();
+    let unknown_model = test_addons_path
+        .join("module_csv").join("data").join("csv_unknown_model").join("not.a.model.csv")
+        .sanitize();
+    let unknown_model_empty = test_addons_path
+        .join("module_csv").join("data").join("csv_unknown_model_empty").join("not.a.model.csv")
+        .sanitize();
+    let valid_csv = test_addons_path
+        .join("module_for_diagnostics").join("data").join("bike_parts.wheel.csv")
+        .sanitize();
+    let relational_ids = test_addons_path
+        .join("module_for_diagnostics").join("data").join("bikes.bike.csv")
+        .sanitize();
+
+    for path in [&field_mismatch, &invalid_xml_id, &duplicate_column, &unknown_model, &unknown_model_empty, &valid_csv, &relational_ids] {
+        assert!(Path::new(path).exists(), "Test file does not exist: {}", path);
+    }
+
+    (field_mismatch, invalid_xml_id, duplicate_column, unknown_model, unknown_model_empty, valid_csv, relational_ids)
+}
+
+fn diagnostics_csv_path(dir: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests").join("data").join("addons")
+        .join("module_for_diagnostics").join("data").join(dir).join("bikes.bike.csv")
+        .sanitize();
+    assert!(Path::new(&path).exists(), "Test file does not exist: {}", path);
+    path
+}
+
+/// The text a single-line diagnostic covers, read by UTF-16 column on BMP-only text.
+fn diag_text(path: &str, diag: &Diagnostic) -> String {
+    let content = std::fs::read_to_string(path).unwrap();
+    let line = content.lines().nth(diag.range.start.line as usize).expect("diagnostic line");
+    let (start, end) = (diag.range.start.character as usize, diag.range.end.character as usize);
+    line.chars().skip(start).take(end - start).collect()
+}
+
+fn collect_all_csv_diagnostics(session: &mut SessionInfo, paths: &[&str]) -> HashMap<String, Vec<Diagnostic>> {
+    let paths_vec: Vec<_> = paths.iter().map(|s| s.to_string()).collect();
+    common::get_diagnostics_for_paths(session, &paths_vec)
+}
+
+fn get_diags_for<'a>(all: &'a HashMap<String, Vec<Diagnostic>>, path: &str) -> &'a [Diagnostic] {
+    all.get(path).map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+fn has_code(diag: &Diagnostic, code: &str) -> bool {
+    diag.code.as_ref().map(|c| match c {
+        lsp_types::NumberOrString::String(s) => s.contains(code),
+        lsp_types::NumberOrString::Number(_) => false,
+    }).unwrap_or(false)
+}
+
+pub fn test_csv_diagnostics(mut session: SessionInfo) {
+    let (field_mismatch, invalid_xml_id, duplicate_column, unknown_model, unknown_model_empty, valid_csv, relational_ids) = csv_test_paths();
+    let escapes = diagnostics_csv_path("csv_escapes");
+    let bom = diagnostics_csv_path("csv_bom");
+
+    // Collect all diagnostics in one pass (consuming the message queue once)
+    let all_diags = collect_all_csv_diagnostics(
+        &mut session,
+        &[&field_mismatch, &invalid_xml_id, &duplicate_column, &unknown_model, &unknown_model_empty, &valid_csv, &relational_ids, &escapes, &bom],
+    );
+
+    test_field_count_mismatch(get_diags_for(&all_diags, &field_mismatch));
+    test_xml_id_format(get_diags_for(&all_diags, &invalid_xml_id));
+    test_duplicate_column(get_diags_for(&all_diags, &duplicate_column));
+    test_unknown_model(get_diags_for(&all_diags, &unknown_model), 12);
+    test_unknown_model(get_diags_for(&all_diags, &unknown_model_empty), 0);
+    test_valid_file_no_errors(get_diags_for(&all_diags, &valid_csv));
+    test_relational_id_column(get_diags_for(&all_diags, &relational_ids), &relational_ids);
+    test_escaped_quotes_before_id(get_diags_for(&all_diags, &escapes), &escapes);
+    test_bom_unknown_first_column(get_diags_for(&all_diags, &bom), &bom);
+}
+
+/// OLS05069: header has 4 fields, data row has 3
+/// File: csv_field_mismatch/res.country.state.csv
+///   Line 0: id,country_id:id,name,code
+///   Line 1: state_mismatch_1,base.au,Test State
+fn test_field_count_mismatch(diagnostics: &[Diagnostic]) {
+    // Must have at least one OLS05069
+    let mismatch_diags: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05069")).collect();
+    assert!(
+        !mismatch_diags.is_empty(),
+        "Expected OLS05069 field mismatch diagnostic, got: {:?}",
+        diagnostics
+    );
+
+    for diag in &mismatch_diags {
+        // Message should mention field counts
+        assert!(
+            diag.message.contains("field"),
+            "OLS05069 message should mention 'field', got: {}",
+            diag.message
+        );
+
+        // Severity should be Warning (per diagnostic_codes_list.rs)
+        assert_eq!(
+            diag.severity,
+            Some(lsp_types::DiagnosticSeverity::WARNING),
+            "OLS05069 should be a warning"
+        );
+
+        // The mismatch is on the data row (line 1, 0-indexed)
+        assert!(
+            diag.range.start.line >= 1,
+            "Field mismatch diagnostic should be on the data row (line >= 1), got line {}",
+            diag.range.start.line
+        );
+    }
+
+    // Verify all diagnostics have well-formed ranges
+    for diag in diagnostics {
+        assert!(diag.code.is_some(), "Diagnostic should have a code");
+        assert!(!diag.message.is_empty(), "Diagnostic should have a message");
+        assert!(
+            diag.range.start <= diag.range.end,
+            "Range start should be <= end: {:?}",
+            diag.range
+        );
+    }
+}
+
+/// OLS05051: xml_id has more than one dot → "module.sub.bad_xml_id"
+/// File: csv_invalid_xml_id/res.country.state.csv
+///   Line 0: id,country_id:id,name,code
+///   Line 1: module.sub.bad_xml_id,base.au,Test State,TS1
+fn test_xml_id_format(diagnostics: &[Diagnostic]) {
+    let xml_id_diags: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05051")).collect();
+    assert!(
+        !xml_id_diags.is_empty(),
+        "Expected OLS05051 xml_id format diagnostic, got: {:?}",
+        diagnostics
+    );
+
+    for diag in &xml_id_diags {
+        // The bad xml_id record is on line 1
+        assert!(
+            diag.range.start.line >= 1,
+            "OLS05051 diagnostic should be on the data row (line >= 1), got line {}",
+            diag.range.start.line
+        );
+    }
+}
+
+/// OLS05076: "name" is declared by two columns, Odoo only uses the last one.
+/// Reported once on the header row.
+/// File: csv_duplicate_column/res.country.state.csv
+///   Line 0: id,country_id:id,name,code,name
+///   Line 1: state_dup_1,base.au,Overwritten,TS1,Odoo keeps this one
+///   Line 2: state_dup_2,base.au,Overwritten too,TS2,Odoo keeps this one too
+fn test_duplicate_column(diagnostics: &[Diagnostic]) {
+    let dup_diags: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05076")).collect();
+    // Two data rows, so a per-record diagnostic would show up here as two
+    assert_eq!(
+        dup_diags.len(),
+        1,
+        "Expected a single OLS05076 on the header row, got: {:?}",
+        diagnostics
+    );
+
+    let diag = dup_diags[0];
+    assert_eq!(
+        diag.severity,
+        Some(lsp_types::DiagnosticSeverity::WARNING),
+        "OLS05076 should be a warning"
+    );
+    assert!(
+        diag.message.contains("name"),
+        "OLS05076 message should name the duplicated column, got: {}",
+        diag.message
+    );
+    // The overwritten column is the first "name", at characters 17..21 of the header
+    assert_eq!(diag.range.start, lsp_types::Position::new(0, 17));
+    assert_eq!(diag.range.end, lsp_types::Position::new(0, 21));
+}
+
+/// OLS05056: the file name is not a known model, the diagnostic spans the header row
+/// File: csv_unknown_model/not.a.model.csv
+///   Line 0: id,name,code
+/// File: csv_unknown_model_empty/not.a.model.csv is empty, so the range is 0..0
+fn test_unknown_model(diagnostics: &[Diagnostic], end: u32) {
+    let model_diags: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05056")).collect();
+    assert_eq!(model_diags.len(), 1, "Expected a single OLS05056, got: {:?}", diagnostics);
+
+    let diag = model_diags[0];
+    assert!(
+        diag.message.contains("not.a.model"),
+        "OLS05056 message should name the model, got: {}",
+        diag.message
+    );
+    assert_eq!(diag.range.start, lsp_types::Position::new(0, 0));
+    assert_eq!(diag.range.end, lsp_types::Position::new(0, end));
+}
+
+/// Well-formed CSV: no error-level diagnostics expected
+/// File: bike_parts.wheel.csv
+///   Line 0: id,name,price,bike_id
+///   Line 1: bike_wheel_6,Road Bike Wheel2,200.0,City Bike
+fn test_valid_file_no_errors(diagnostics: &[Diagnostic]) {
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
+        .collect();
+
+    assert!(
+        errors.is_empty(),
+        "Well-formed CSV should not have error diagnostics, got: {}",
+        errors
+            .iter()
+            .map(|d| format!(
+                "{}: {}",
+                d.code.as_ref().map(|c| format!("{:?}", c)).unwrap_or_default(),
+                d.message
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+}
+
+/// Each id of a relational `/id` list is validated on its own, bikes.bike.csv line 2 has one bad
+fn test_relational_id_column(diagnostics: &[Diagnostic], path: &str) {
+    let unknown: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05001")).collect();
+    assert_eq!(unknown.len(), 1, "Expected only the one bogus id to be unknown, got: {:?}", diagnostics);
+    // The range spans that id alone, not the whole cell
+    let content = std::fs::read_to_string(path).unwrap();
+    let range = &unknown[0].range;
+    let line = content.lines().nth(range.start.line as usize).expect("diagnostic line");
+    assert_eq!(&line[range.start.character as usize..range.end.character as usize], "bike_wheel_DOES_NOT_EXIST");
+}
+
+/// `""` escapes and multi-byte characters in an earlier cell must not shift the id range
+fn test_escaped_quotes_before_id(diagnostics: &[Diagnostic], path: &str) {
+    let unknown: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05001")).collect();
+    assert_eq!(unknown.len(), 1, "Expected one unknown id, got: {:?}", diagnostics);
+    assert_eq!(diag_text(path, unknown[0]), "bike_wheel_ESCAPED_MISSING");
+}
+
+/// The header range of a BOM file must not start inside the BOM
+fn test_bom_unknown_first_column(diagnostics: &[Diagnostic], path: &str) {
+    let unknown: Vec<_> = diagnostics.iter().filter(|d| has_code(d, "OLS05057")).collect();
+    assert_eq!(unknown.len(), 1, "Expected one unknown column, got: {:?}", diagnostics);
+    // the disk text keeps the BOM and counts it as a column on line 0 (T11)
+    assert_eq!(diag_text(path, unknown[0]), "xy");
+}

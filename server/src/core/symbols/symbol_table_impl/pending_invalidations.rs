@@ -8,7 +8,7 @@ use crate::{constants::BuildSteps, core::symbols::symbol_keys::{KeyValidator, So
 /// Only `symbol_table_impl` can request and apply them: the rest of the crate can only defer them, or hold the
 /// invalidations of sub functions (see `BuildScheduler::defer_invalidations` and
 /// `BuildScheduler::hold_sub_functions_invalidations`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PendingInvalidations {
     /// Number of builds (or other operations, see `BuildScheduler::defer_invalidations`) in progress, that defer
     /// the invalidations

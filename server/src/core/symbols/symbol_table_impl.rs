@@ -61,7 +61,7 @@ struct MemberSearch {
 /// Results of [`SymbolTable::get_member_symbol`], reused while the symbols can not change: the cache is only
 /// enabled during read-only work (validation of a python file, search of references, see [`MemberCache::start`])
 /// and is suspended during any ARCH or ARCH_EVAL build, and emptied when the classes of a model change or a symbol is unloaded.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MemberCache {
     /// (target, from_module, flags) -> member name -> (result, diagnostics)
     results: HashMap<(SymbolKey, Option<ModuleKey>, u8), HashMap<String, (Vec<SymbolKey>, Vec<Diag>)>>,

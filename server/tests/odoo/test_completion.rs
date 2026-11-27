@@ -1,0 +1,650 @@
+use std::env;
+use std::path::Path;
+
+use lsp_types::CompletionResponse;
+use odoo_ls_server::core::file_mgr::FileMgr;
+use odoo_ls_server::core::odoo::{Odoo, SyncOdoo};
+use odoo_ls_server::features::completion::CompletionFeature;
+use odoo_ls_server::odoo_version::OdooVersion;
+use odoo_ls_server::threads::SessionInfo;
+use odoo_ls_server::utils::PathSanitizer;
+
+fn labels(response: Option<CompletionResponse>) -> Vec<String> {
+    let items = match response {
+        Some(CompletionResponse::Array(items)) => items,
+        Some(CompletionResponse::List(list)) => list.items,
+        None => vec![],
+    };
+    items.into_iter().map(|i| i.label).collect()
+}
+
+/// `fields.Char(compute="...", depends=["partner_id.disp"])`: the `depends` kwarg should
+/// offer nested-field completion on the last dotted segment, exactly like `related=`.
+pub fn test_depends_kwarg_nested_field_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("base_test_models.py").sanitize();
+    assert!(Path::new(&test_file).exists(), "Test file does not exist: {}", test_file);
+
+    let file_mgr = session.file_mgr();
+    let file_info = file_mgr.get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // Line `    partner_display_name_dep = fields.Char(compute="_compute_partner_display_name_dep", depends=["partner_id.disp"])`
+    // (0-indexed line 79), cursor right after "disp" inside the string.
+    let response = CompletionFeature::autocomplete(session, file_symbol, file_info, None, 79, 113);
+    let labels = labels(response);
+    assert!(labels.iter().any(|l| l == "display_name"), "Expected display_name to be suggested for the 'disp' prefix, got: {:?}", labels);
+    assert!(!labels.iter().any(|l| l == "create_uid"), "create_uid does not match the 'disp' prefix, got: {:?}", labels);
+    assert!(!labels.iter().any(|l| l == "id"), "id does not match the 'disp' prefix, got: {:?}", labels);
+}
+
+/// The element of a list or a tuple is completed with the cursor at its end, when no type is expected.
+/// e.g. `companies = [self.company_id]`, with the cursor after `company_id`
+pub fn test_list_element_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let disk_text = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // The line holding the element, and the element, completed with the cursor at its end
+    let cases = [
+        ("companies = [self.company_id]", "self.company_id"),
+        // The first element of a tuple
+        ("company_pairs = (self.company_id, self.company_id)", "self.company_id"),
+    ];
+    for (line_text, element) in cases {
+        let (line, text) = disk_text.lines().enumerate().find(|(_, text)| text.contains(line_text)).unwrap();
+        let character = (text.find(element).unwrap() + element.len()) as u32;
+        let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line as u32, character));
+        assert!(labels.iter().any(|l| l == "company_id"), "Expected `company_id` after `{}` in `{}`, got: {:?}", element, line_text, labels);
+    }
+}
+
+/// `default=lambda self: ...` stores a `<lambda>` child on the class, but it is not a member:
+/// `self.` must never offer it.
+pub fn test_lambda_is_not_a_member(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let disk_text = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+    // The line that is exactly `return self`, as other lines of the fixture start with it (`return self....`).
+    // Don't match on the line ending: the fixture may be checked out with CRLF (git autocrlf on Windows).
+    let return_lines: Vec<usize> = disk_text.lines().enumerate()
+        .filter(|(_, line)| line.trim() == "return self")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(return_lines.len(), 1, "Expected a single 'return self' line in {}", test_file);
+    let return_line = return_lines[0];
+
+    // Open the buffer with the dot typed after `return self`: the completed attribute name is
+    // then empty, so every member of LambdaDefaultModel is offered.
+    let text: String = disk_text.split_inclusive('\n').enumerate()
+        .map(|(index, line)| if index == return_line { line.replacen("return self", "return self.", 1) } else { line.to_string() })
+        .collect();
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: lsp_types::TextDocumentItem {
+            uri: FileMgr::pathname2uri(&test_file),
+            language_id: "python".to_string(),
+            version: 1,
+            text,
+        }
+    };
+    Odoo::handle_did_open(session, did_open_params);
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // Cursor after the dot of `return self.`
+    let column = disk_text.lines().nth(return_line).unwrap().find("return self").unwrap() + "return self.".len();
+    let response = CompletionFeature::autocomplete(session, file_symbol, file_info, None, return_line as u32, column as u32);
+    let labels = labels(response);
+    assert!(labels.iter().any(|l| l == "company_id"), "Expected the model fields to be suggested after 'self.', got: {:?}", labels);
+    assert!(!labels.iter().any(|l| l == "<lambda>"), "<lambda> is not a member and must not be suggested, got: {:?}", labels);
+}
+
+/// `odoo/init.py` (>= 18.1) injects `_`, `_lt`, `Command` and `SUPERUSER_ID` into the `odoo`
+/// namespace as ext symbols: they must be offered both in `from odoo import` and after `odoo.`.
+pub fn test_ext_symbols_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+
+    let file_info = session.sync_odoo.file_mgr.get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // `from odoo import api, fields, models, _, tools`: cursor right after `_`
+    let response = CompletionFeature::autocomplete(session, file_symbol, file_info, None, 0, 39);
+    let import_labels = labels(response);
+    assert!(import_labels.iter().any(|l| l == "_"), "Expected '_' to be suggested in 'from odoo import', got: {:?}", import_labels);
+    assert!(import_labels.iter().any(|l| l == "_lt"), "Expected '_lt' to be suggested in 'from odoo import', got: {:?}", import_labels);
+
+    // `        return odoo.Comm` (0-indexed line 25), cursor after `Comm`
+    let response = CompletionFeature::autocomplete(session, file_symbol, file_info, None, 28, 24);
+    let attr_labels = labels(response);
+    assert!(attr_labels.iter().any(|l| l == "Command"), "Expected 'Command' to be suggested after 'odoo.', got: {:?}", attr_labels);
+}
+
+/// `fields.Integer(compute_sql="...")`: the kwarg offers method completion, but only from 19.1 on
+pub fn test_compute_sql_kwarg_method_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("base_test_models.py").sanitize();
+
+    let file_mgr = session.file_mgr();
+    let file_info = file_mgr.get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // Cursor inside the compute_sql value of `test_int = fields.Integer(..., compute_sql="...")`
+    session.sync_odoo.version = OdooVersion::new(19, 1, 0);
+    let gated_in = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 8, 80));
+    assert!(gated_in.iter().any(|l| l == "_compute_something"), "Expected _compute_something to be suggested for compute_sql, got: {:?}", gated_in);
+    session.sync_odoo.version = OdooVersion::new(19, 0, 0);
+    let gated_out = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 8, 80));
+    assert!(!gated_out.iter().any(|l| l == "_compute_something"), "Expected no method completion for compute_sql before 19.1, got: {:?}", gated_out);
+}
+
+/// `group_expand=`, `selection=` and the first positional argument of a Selection or a Reference offer methods
+pub fn test_selection_field_method_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("base_test_models.py").sanitize();
+
+    let file_mgr = session.file_mgr();
+    let file_info = file_mgr.get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // Cursor after the 4-char prefix of each string on the `state`, `kind`, `reference` and `reference_pos` field lines
+    for (line, column, method) in [(85, 34, "_selection_state"), (85, 67, "_expand_states"), (86, 43, "_selection_state"), (97, 48, "_selection_state"), (98, 42, "_selection_state")] {
+        let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line, column));
+        assert!(labels.iter().any(|l| l == method), "Expected {method} to be suggested at {line}:{column}, got: {:?}", labels);
+    }
+    let label_labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 87, 29));
+    assert!(!label_labels.iter().any(|l| l == "_selection_state"), "The label of a Char is not a method name, got: {:?}", label_labels);
+    // A Char takes no `selection`: given by keyword, it is not a method name either
+    let note_labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 88, 38));
+    assert!(!note_labels.iter().any(|l| l == "_selection_state"), "The `selection` of a Char is not a method name, got: {:?}", note_labels);
+}
+
+/// A string given to a call is completed by what its parameter expects, whether it is given by
+/// position or by keyword
+pub fn test_call_argument_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    let mut failures = vec![];
+    // (text right before the cursor, labels that must be offered, labels that must not)
+    let cases: [(&str, &[&str], &[&str]); 27] = [
+        // A model name
+        (r#"Many2one("module_1.lambda_def"#, &["module_1.lambda_default_model"], &[]),
+        (r#"Many2one(comodel_name="module_1.lambda_def"#, &["module_1.lambda_default_model"], &[]),
+        // A field of the comodel
+        (r#""module_1.call_arguments_model", "par"#, &["parent_id"], &["name"]),
+        (r#"inverse_name="par"#, &["parent_id"], &["name"]),
+        // A field path ending on a field of the type of the field class
+        (r#"related="parent_id.na"#, &["name"], &["name_count"]),
+        // A domain on the model searched
+        (r#"self.search([("na"#, &["name", "name_count"], &[]),
+        (r#"self.search(domain=[("na"#, &["name", "name_count"], &[]),
+        // A domain on the model searched, by the other search methods
+        (r#"self.search_count([("na"#, &["name", "name_count"], &[]),
+        (r#"self.search_fetch([("na"#, &["name", "name_count"], &[]),
+        (r#"self.search_read(domain=[("na"#, &["name", "name_count"], &[]),
+        (r#"self._search([("na"#, &["name", "name_count"], &[]),
+        // A domain on the model, by the other methods taking one
+        (r#"self.filtered_domain([("na"#, &["name", "name_count"], &[]),
+        (r#"self._read_group([("na"#, &["name", "name_count"], &[]),
+        (r#"self.name_search("x", [("na"#, &["name", "name_count"], &[]),
+        // A key of the values given to create, write or update, not a value
+        (r#"self.create({"na"#, &["name", "name_count"], &[]),
+        (r#"self.create({"na": "na"#, &[], &["name", "name_count"]),
+        (r#"self.sudo().create([{"na"#, &["name", "name_count"], &[]),
+        (r#"call_arguments_model"].create([{"na"#, &["name", "name_count"], &[]),
+        (r#"self.write({"na"#, &["name", "name_count"], &[]),
+        (r#"self.update({"na"#, &["name", "name_count"], &[]),
+        // The values given by keyword
+        (r#"create(vals_list=[{"na"#, &["name", "name_count"], &[]),
+        (r#"write(vals={"na"#, &["name", "name_count"], &[]),
+        (r#"update(values={"na"#, &["name", "name_count"], &[]),
+        // The fields of the model the method is called on
+        (r#"lambda_default_model"].create({"comp"#, &["company_id"], &[]),
+        // The first key, before its `:`, is in a set
+        (r#"self.sudo().write({"na"#, &["name", "name_count"], &[]),
+        (r#"self.with_context().create([{"na"#, &["name", "name_count"], &[]),
+        // `write` takes no list of values
+        (r#"self.with_context().write([{"na"#, &[], &["name", "name_count"]),
+    ];
+    for (before_cursor, offered, not_offered) in cases {
+        let (line, text) = content.lines().enumerate().find(|(_, text)| text.contains(before_cursor)).unwrap();
+        let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+        let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line as u32, character));
+        let missing: Vec<_> = offered.iter().filter(|label| !labels.iter().any(|l| l == *label)).collect();
+        let unexpected: Vec<_> = not_offered.iter().filter(|label| labels.iter().any(|l| l == *label)).collect();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            failures.push(format!("after `{before_cursor}`: missing {missing:?}, unexpected {unexpected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "call argument completion:\n{}", failures.join("\n"));
+}
+
+/// The operators offered in a domain leaf depend on the Odoo version.
+/// e.g. `not =like` and `not =ilike` from saas-18.2
+pub fn test_domain_operator_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // In the operator string of `self.search([("company_id", "=", 1)])`
+    let before_cursor = r#"self.search([("company_id", ""#;
+    let (line, text) = content.lines().enumerate().find(|(_, text)| text.contains(before_cursor)).unwrap();
+    let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+
+    let mut failures = vec![];
+    // (version, whether `not =like` and `not =ilike` are offered)
+    for (test_version, offered) in [(OdooVersion::new(18, 1, 0), false), (OdooVersion::new(18, 2, 0), true)] {
+        session.sync_odoo.version = test_version;
+        let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line as u32, character));
+        for operator in ["=like", "not =like", "not =ilike"] {
+            // `=like` is offered in every version
+            let expected = offered || operator == "=like";
+            if labels.iter().any(|l| l == operator) != expected {
+                failures.push(format!("{operator} on {test_version:?}: expected offered: {expected}, got {labels:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "domain operator completion:\n{}", failures.join("\n"));
+}
+
+/// `init_storage="..."` offers method completion, but only from 20.0 on
+pub fn test_init_storage_kwarg_method_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("base_test_models.py").sanitize();
+
+    let file_mgr = session.file_mgr();
+    let file_info = file_mgr.get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    session.sync_odoo.version = OdooVersion::new(20, 0, 0);
+    let gated_in = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 86, 76));
+    assert!(gated_in.iter().any(|l| l == "_init_column_kind"), "Expected _init_column_kind to be suggested for init_storage, got: {:?}", gated_in);
+    session.sync_odoo.version = OdooVersion::new(19, 4, 0);
+    let gated_out = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, 86, 76));
+    assert!(!gated_out.iter().any(|l| l == "_init_column_kind"), "Expected no method completion for init_storage before 20.0, got: {:?}", gated_out);
+}
+
+/// `self.create_uid.log`: `create_uid` is added to every model as a many2one to `res.users`, so its
+/// attributes are those of `res.users`.
+pub fn test_magic_field_comodel_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    let before_cursor = "self.create_uid.log";
+    let (line, text) = content.lines().enumerate().find(|(_, text)| text.contains(before_cursor)).unwrap();
+    let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+    let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line as u32, character));
+    assert!(labels.iter().any(|l| l == "login"), "Expected `login` of `res.users` after `{before_cursor}`, got: {:?}", labels);
+}
+
+/// `_order = "name,\tid"` gets no completion, and no panic.
+/// The escape makes the decoded value one byte shorter than its source, so the cursor cannot be located in it.
+pub fn test_order_completion_with_escape(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+    let test_file = test_addons_path
+        .join("module_1")
+        .join("models")
+        .join("to_complete.py")
+        .sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file))
+    else {
+        panic!("Failed to get file symbol");
+    };
+
+    let (line, text) = content
+        .lines()
+        .enumerate()
+        .find(|(_, text)| text.contains("_order = "))
+        .unwrap();
+    let character = text.rfind('"').unwrap() as u32;
+    let labels = labels(CompletionFeature::autocomplete(
+        session,
+        file_symbol,
+        file_info,
+        None,
+        line as u32,
+        character,
+    ));
+    assert!(
+        labels.is_empty(),
+        "Expected no completion in a part with escapes, got: {:?}",
+        labels
+    );
+}
+
+/// Completion in `_order = "name desc nulls last, escape_id.id, name.id, id"`.
+/// What is offered depends on the word of the item under the cursor:
+/// the field first, then its direction, then where nulls go.
+pub fn test_order_completion_by_word(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+    let test_file = test_addons_path
+        .join("module_1")
+        .join("models")
+        .join("to_complete.py")
+        .sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file))
+    else {
+        panic!("Failed to get file symbol");
+    };
+
+    let (line, text) = content
+        .lines()
+        .enumerate()
+        .find(|(_, text)| text.contains(r#"_order = "name desc"#))
+        .unwrap();
+    let mut failures = vec![];
+    // (text right before the cursor, labels that must be offered, labels that must not)
+    let cases: [(&str, &[&str], &[&str]); 10] = [
+        (r#""na"#, &["name"], &["id", "desc"]),
+        (r#""name "#, &["asc", "desc", "nulls first", "nulls last"], &["name", "id"]),
+        (r#""name d"#, &["desc"], &["asc", "nulls first", "name"]),
+        ("desc ", &["nulls first", "nulls last"], &["asc", "desc", "name"]),
+        ("nulls ", &["first", "last"], &["nulls first", "name"]),
+        (", ", &["name", "id"], &["asc", "desc"]),
+        // Right after the closing quote, so outside the string
+        ("id\"", &[], &["name", "id", "asc", "desc"]),
+        // After a many2one and a `.`, only its `id`
+        ("escape_id.", &["id"], &["name", "escape_id", "asc"]),
+        ("escape_id.i", &["id"], &["name", "escape_id"]),
+        // `name` is not a many2one
+        ("name.", &[], &["id", "name"]),
+    ];
+    for (before_cursor, offered, not_offered) in cases {
+        let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+        let labels = labels(CompletionFeature::autocomplete(
+            session,
+            file_symbol,
+            file_info,
+            None,
+            line as u32,
+            character,
+        ));
+        let missing: Vec<_> = offered
+            .iter()
+            .filter(|label| !labels.iter().any(|l| l == *label))
+            .collect();
+        let unexpected: Vec<_> = not_offered
+            .iter()
+            .filter(|label| labels.iter().any(|l| l == *label))
+            .collect();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            failures.push(format!(
+                "after `{before_cursor}`: missing {missing:?}, unexpected {unexpected:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "`_order` completion:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The order of a search method, e.g. `search([], order="name d")`, is completed like `_order`.
+/// It is given by keyword or by position, with the fields of the model searched.
+pub fn test_order_kwarg_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+    let test_file = test_addons_path
+        .join("module_1")
+        .join("models")
+        .join("to_complete.py")
+        .sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file))
+    else {
+        panic!("Failed to get file symbol");
+    };
+
+    let mut failures = vec![];
+    // (text right before the cursor, labels that must be offered, labels that must not)
+    let cases: [(&str, &[&str], &[&str]); 8] = [
+        (r#"search([], order="na"#, &["name"], &["desc"]),
+        (r#"search([], order="name d"#, &["desc"], &["asc", "name"]),
+        // By position, after a many2one and a `.`
+        (r#"search([], 0, None, "escape_id."#, &["id"], &["name", "escape_id"]),
+        // The fields of the model searched, not of the class the call is in
+        (r#"search_read([], order=""#, &["name"], &["escape_id"]),
+        // Not a search method
+        (r#"with_context(order="na"#, &[], &["name"]),
+        // An override that takes the order in `*args` by position, or in `**kwargs` by keyword.
+        // The base method declares it
+        (r#"_search([], 0, None, "na"#, &["name"], &[]),
+        (r#"_search([], order="na"#, &["name"], &[]),
+        // An override that declares `order` with a default order. The base method marks it
+        (r#"search_read([], None, 0, None, "na"#, &["name"], &[]),
+    ];
+    for (before_cursor, offered, not_offered) in cases {
+        let (line, text) = content
+            .lines()
+            .enumerate()
+            .find(|(_, text)| text.contains(before_cursor))
+            .unwrap();
+        let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+        let labels = labels(CompletionFeature::autocomplete(
+            session,
+            file_symbol,
+            file_info,
+            None,
+            line as u32,
+            character,
+        ));
+        let missing: Vec<_> = offered
+            .iter()
+            .filter(|label| !labels.iter().any(|l| l == *label))
+            .collect();
+        let unexpected: Vec<_> = not_offered
+            .iter()
+            .filter(|label| labels.iter().any(|l| l == *label))
+            .collect();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            failures.push(format!(
+                "after `{before_cursor}`: missing {missing:?}, unexpected {unexpected:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "`order=` completion:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// An annotated assignment, e.g. `_order: str = "name, "`, is completed like `_order = ...`
+pub fn test_order_completion_annotated(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+    let test_file = test_addons_path
+        .join("module_1")
+        .join("models")
+        .join("to_complete.py")
+        .sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file))
+    else {
+        panic!("Failed to get file symbol");
+    };
+
+    let before_cursor = r#"_order: str = "name, "#;
+    let (line, text) = content
+        .lines()
+        .enumerate()
+        .find(|(_, text)| text.contains(before_cursor))
+        .unwrap();
+    let character = (text.find(before_cursor).unwrap() + before_cursor.len()) as u32;
+    let labels = labels(CompletionFeature::autocomplete(
+        session,
+        file_symbol,
+        file_info,
+        None,
+        line as u32,
+        character,
+    ));
+    for label in ["name", "id"] {
+        assert!(
+            labels.iter().any(|l| l == label),
+            "Expected `{label}` after `{before_cursor}`, got: {labels:?}"
+        );
+    }
+}
+
+/// `_order = "name "` outside the body of a model class is not the model's `_order`.
+/// It gets no completion, neither in a class that is not a model nor as a local variable in a method.
+pub fn test_order_completion_outside_model(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons");
+    let test_file = test_addons_path
+        .join("module_1")
+        .join("models")
+        .join("to_complete.py")
+        .sanitize();
+    let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file))
+    else {
+        panic!("Failed to get file symbol");
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let before_cursor = r#"_order = "name "#;
+    let mut failures = vec![];
+    for class in ["class OrderPlainClass", "class OrderLocalModel"] {
+        // The first `_order` after the class line
+        let class_line = lines
+            .iter()
+            .position(|text| text.starts_with(class))
+            .unwrap();
+        let line = class_line
+            + lines[class_line..]
+                .iter()
+                .position(|text| text.contains(before_cursor))
+                .unwrap();
+        let character = (lines[line].find(before_cursor).unwrap() + before_cursor.len()) as u32;
+        let labels = labels(CompletionFeature::autocomplete(
+            session,
+            file_symbol,
+            file_info,
+            None,
+            line as u32,
+            character,
+        ));
+        if !labels.is_empty() {
+            failures.push(format!("{class}: expected no completion, got: {labels:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "`_order` completion outside a model:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// `import ｏ|ｓ`: the AST holds the NFKC-normalized name `os`, so the typed prefix must be read up
+/// to the cursor in the source, not by slicing the normalized name with source offsets.
+pub fn test_import_completion_with_normalized_name(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_semantic_tokens").join("models").join("sem_tokens_non_ascii.py").sanitize();
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+    // Cursor right after `ｏ` (UTF-16 columns) in `import ｏｓ` (0-indexed line 3) and in
+    // `from ｏｓ import path` (line 4).
+    let mut failures = vec![];
+    for (line, character) in [(3, 8), (4, 6)] {
+        let labels = labels(CompletionFeature::autocomplete(session, file_symbol, file_info, None, line, character));
+        let has_os = labels.iter().any(|l| l == "os");
+        let others: Vec<&String> = labels.iter().filter(|l| !l.starts_with('o')).collect();
+        if !has_os || !others.is_empty() {
+            failures.push(format!("line {line}: `os` suggested: {has_os}, {} names not starting with the typed `o`, e.g. {:?}",
+                others.len(), &others[..others.len().min(5)]));
+        }
+    }
+    assert!(failures.is_empty(), "Import completion on an NFKC-normalized name:\n{}", failures.join("\n"));
+}
+
+/// Members of `object` (`__class__`, ...) are offered on models, even if `object` is not in their bases.
+pub fn test_object_members_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
+    let disk_text = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: lsp_types::TextDocumentItem {
+            uri: FileMgr::pathname2uri(&test_file),
+            language_id: "python".to_string(),
+            version: 3,
+            text: disk_text.replace("return self\n", "return self.__cl\n"),
+        }
+    };
+    Odoo::handle_did_open(session, did_open_params);
+
+    let file_info = session.file_mgr().get_file_info(&test_file).unwrap();
+    let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+        panic!("Failed to get file symbol");
+    };
+
+    // `        return self.__cl` (0-indexed line 24), cursor after `__cl`
+    let response = CompletionFeature::autocomplete(session, file_symbol, file_info, None, 24, 24);
+    let labels = labels(response);
+    assert!(labels.iter().any(|l| l == "__class__"), "Expected '__class__' to be suggested after 'self.__cl', got: {:?}", labels);
+}

@@ -1,0 +1,170 @@
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit,
+};
+use odoo_ls_server::threads::SessionInfo;
+
+use crate::js_owl_helpers::requests::*;
+
+use super::fixture::FixtureFile;
+
+/// Assert the hover at the caret contains `expected`. Only the `name: type` half of tsserver's
+/// output is worth asserting: the `(property)` / `(getter)` prefix moves between TS versions.
+#[track_caller]
+pub fn assert_hover(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, expected: &str) {
+    let hover = hover(session, file, snippet);
+    assert!(
+        hover.contains(expected),
+        "hover at {snippet:?} is {hover:?}, expected it to contain {expected:?}"
+    );
+}
+
+/// Assert the definition at the caret lands in `target`, on the line holding `target_snippet`.
+#[track_caller]
+pub fn assert_definition(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, target: &FixtureFile, target_snippet: &str) {
+    let expected = (target.path.clone(), target.caret(target_snippet).line);
+    let found = definitions(session, file, snippet);
+    assert!(
+        found.contains(&expected),
+        "definition of {snippet:?} is {found:?}, expected {expected:?} ({target_snippet:?})"
+    );
+}
+
+/// Assert the definition at the caret lands in a file whose path ends with `path_suffix`.
+#[track_caller]
+pub fn assert_definition_in(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, path_suffix: &str) {
+    let found = definitions(session, file, snippet);
+    assert!(
+        found.iter().any(|(path, _)| path.ends_with(path_suffix)),
+        "definition of {snippet:?} is {found:?}, expected a target in {path_suffix:?}"
+    );
+}
+
+/// Assert the module `specifier` imported by `file` resolves to `target` (a fixture). 
+#[track_caller]
+pub fn assert_import_resolves(session: &mut SessionInfo, file: &FixtureFile, specifier: &str, target: &FixtureFile) {
+    assert_import_resolves_in(session, file, specifier, &target.path);
+}
+
+/// Assert the module `specifier` imported by `file` resolves to a `target` whose path ends with `suffix`
+#[track_caller]
+pub fn assert_import_resolves_in(session: &mut SessionInfo, file: &FixtureFile, specifier: &str, path_suffix: &str) {
+    let found = definitions(session, file, &format!("\"|{specifier}\""));
+    assert!(
+        found.iter().any(|(path, _)| path.ends_with(path_suffix)),
+        "import {specifier:?} in {} resolves to {found:?}, expected {path_suffix:?}",
+        file.path
+    );
+}
+
+/// Assert the module `specifier` imported by `file` names nothing: no `paths` entry covers it.
+#[track_caller]
+pub fn assert_import_unresolved(session: &mut SessionInfo, file: &FixtureFile, specifier: &str) {
+    let found = definitions(session, file, &format!("\"|{specifier}\""));
+    assert!(
+        found.is_empty(),
+        "import {specifier:?} in {} resolves to {found:?}, expected nothing",
+        file.path
+    );
+}
+
+/// Assert one completion request at the caret offers every `(label, kind)`. The kind matters as
+/// much as the label: clients render `TEXT` as a plain word suggestion, so a symbol whose kind
+/// went unmapped looks like editor noise.
+#[track_caller]
+pub fn assert_completions(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, expected: &[(&str, CompletionItemKind)]) {
+    let items = completions(session, file, snippet);
+    for (label, kind) in expected {
+        let item = items.iter().find(|item| item.label == *label).unwrap_or_else(|| panic!(
+            "no completion {label:?} at {snippet:?} in {}", file.path
+        ));
+        assert_eq!(item.kind, Some(*kind), "kind of completion {label:?} at {snippet:?}");
+    }
+}
+
+/// Assert one completion request at the caret offers none of `unexpected`.
+#[track_caller]
+pub fn assert_no_completions(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, unexpected: &[&str]) {
+    let items = completions(session, file, snippet);
+    for label in unexpected {
+        assert!(
+            !items.iter().any(|item| item.label == *label),
+            "completion {label:?} is offered at {snippet:?} in {}", file.path
+        );
+    }
+}
+
+/// Assert accepting the completion `label` at the caret writes `import_statement`.
+/// The edit only exists after a `completionItem/resolve`.
+#[track_caller]
+pub fn assert_auto_import(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, label: &str, import_statement: &str) {
+    let item = resolved_completion(session, file, snippet, label);
+    let inserted = item.additional_text_edits.iter().flatten()
+        .map(|edit| edit.new_text.as_str())
+        .collect::<String>();
+    assert!(
+        inserted.contains(import_statement),
+        "accepting {label:?} at {snippet:?} in {} writes {inserted:?}, expected it to contain {import_statement:?}",
+        file.path
+    );
+}
+
+/// Assert the completion `label` at the caret replaces the unfinished import with
+/// `import_statement`. No need for `completionItem/resolve` round trip.
+#[track_caller]
+pub fn assert_import_completion(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, label: &str, import_statement: &str) {
+    let items = completions(session, file, snippet);
+    let item = items.iter().find(|item| item.label == label).unwrap_or_else(|| panic!(
+        "no completion {label:?} at {snippet:?} in {}", file.path
+    ));
+    let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+        panic!("completion {label:?} at {snippet:?} carries no edit, got {:?}", item.text_edit)
+    };
+    assert!(
+        edit.new_text.contains(import_statement),
+        "accepting {label:?} at {snippet:?} in {} writes {:?}, expected it to contain {import_statement:?}",
+        file.path, edit.new_text
+    );
+}
+
+/// Assert one completion request at the caret offers every `(label, label_details)`.
+#[track_caller]
+pub fn assert_completions_label_details(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, expected: &[(&str, &str)]) {
+    let items = completions(session, file, snippet);
+    for (label, label_details) in expected {
+        let item = items.iter().find(|item| item.label == *label).unwrap_or_else(|| panic!(
+            "no completion {label:?} at {snippet:?} in {}", file.path
+        ));
+        let item_label_details = item.label_details.as_ref()
+            .unwrap_or_else(|| panic!("no label detail for {label:?} at {snippet:?} in {}", file.path))
+            .description.as_ref()
+            .unwrap_or_else(|| panic!("no label detail description for {label:?} at {snippet:?} in {}", file.path));
+        assert_eq!(item_label_details.as_str(), *label_details,
+            "label details of completion {label:?} at {snippet:?}"
+        );
+    }
+}
+
+/// Assert the references at the caret are exactly `expected`, each given as a caret snippet in the
+/// fixture holding it.
+#[track_caller]
+pub fn assert_references(session: &mut SessionInfo, file: &FixtureFile, snippet: &str, expected: &[(&FixtureFile, &str)]) {
+    let mut expected: Vec<(String, u32, u32)> = expected.iter().map(|(target, target_snippet)| {
+        let position = target.caret(target_snippet);
+        (target.path.clone(), position.line, position.character)
+    }).collect();
+    expected.sort();
+    let mut found = references(session, file, snippet);
+    found.sort();
+    assert_eq!(found, expected, "references of {snippet:?} in {}", file.path);
+}
+
+/// Assert the `detail` field of a completion item contains `expected`.
+#[track_caller]
+pub fn assert_detail(item: &CompletionItem, expected: &str) {
+    let detail = item.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains(expected),
+        "detail of completion {:?} is {detail:?}, expected it to contain {expected:?}",
+        item.label
+    );
+}

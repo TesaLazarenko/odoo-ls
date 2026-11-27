@@ -22,7 +22,7 @@ new_key_type! {
     pub struct ModelKey;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelMgr {
     models_index: HashMap<OYarn, ModelKey>,
     models_arena: SlotMap<ModelKey, Model>,
@@ -90,7 +90,7 @@ impl std::ops::IndexMut<ModelKey> for ModelMgr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelData {
     pub name: OYarn,
     pub inherit: Vec<OYarn>,
@@ -149,7 +149,7 @@ impl ModelData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Model {
     name: OYarn,
     /// The python classes of the model, with what [`ModelClassesWalker`] needs to know about them
@@ -162,7 +162,7 @@ pub struct Model {
 
 /// A class of a model, with its module and the models it points to, resolved when the class is added to the model
 /// so that browsing the inheritance of a model does not have to look for them again.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ModelClass {
     /// The module declaring the class, with its directory name to check the dependencies
     module: Option<(ModuleKey, OYarn)>,
