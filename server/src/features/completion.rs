@@ -7,16 +7,17 @@ use crate::core::evaluation_context::{Context, ContextKey, ContextValue};
 use crate::core::evaluation_utils::DeepFieldEvalWalker;
 use crate::core::file_mgr::FileInfoKey;
 use crate::core::import_resolver;
-use crate::core::odoo::SyncOdoo;
 use crate::core::python_odoo_builder::ACCESS_OPERATOR_OPTIONS;
 use crate::core::symbols::storage::xml::xml_field_symbol::XmlFieldName;
-use crate::core::symbols::{FunctionSymbol, ModuleSymbol};
-use crate::core::symbols::symbol_keys::{ClassKey, ModuleKey, SourceFileKey, SymbolKey};
+use crate::core::symbols::ModuleSymbol;
+use crate::core::symbols::symbol_keys::{
+    ClassKey, ModelSymbolKey, ModuleKey, SourceFileKey, SymbolKey,
+};
 use crate::core::symbols::storage::SymbolTable;
 use crate::features::ast_utils::AstUtils;
-use crate::features::features_utils::FeaturesUtils;
+use crate::features::features_utils;
+use crate::features::features_utils::{ApiDecorator, FieldParam, OrderItem, SpecialArg};
 use crate::threads::SessionInfo;
-use crate::tree::OYarnExt;
 use crate::{Sy, S};
 use itertools::Itertools;
 use lsp_types::{
@@ -45,6 +46,10 @@ pub enum ExpectedType {
     EXTERNAL_FIELD(OYarn), // Like in inverse_name='field_name', we attach the comodel_name
     METHOD_NAME,
     INHERITS,
+    ORDER(ClassKey), // An order on the fields of the model, like `_order = "name desc"`
+    RECORD_VALUES(ModelSymbolKey), // The field values of the model, like in `write({'name': 'x'})`
+    RECORD_VALUES_LIST(ModelSymbolKey), // A list (or values directly for Backwards compatibility) of field values of the model for `create`
+    MODEL_FIELD(ModelSymbolKey), // A field of the model, like the keys of the values given to `write({'name': 'x'})`
 }
 
 pub struct CompletionFeature;
@@ -171,17 +176,43 @@ fn complete_delete_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey, stmt
     complete_expr( target, session, file, offset, false, &[])
 }
 
-fn complete_assign_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey, stmt_assign: &ruff_python_ast::StmtAssign, offset: usize) -> Option<CompletionResponse> {
-    let mut expected_type = vec![];
-    if stmt_assign.targets.len() == 1
-        && let Some(target_name) = stmt_assign.targets.first().unwrap().as_name_expr() {
-            match target_name.id.as_str() {
-                "_inherit" => expected_type.push(ExpectedType::MODEL_NAME),
-                "_inherits" => expected_type.push(ExpectedType::INHERITS),
-                _ => {}
-            }
+/// Returns the expected types of the `value` assigned to `target`, based on the target name.
+/// e.g. model names for `_inherit`
+fn expected_types_of_target(
+    session: &mut SessionInfo,
+    file: SourceFileKey,
+    target: &Expr,
+    value: &Expr,
+) -> Vec<ExpectedType> {
+    let Some(target_name) = target.as_name_expr() else {
+        return vec![];
+    };
+    match target_name.id.as_str() {
+        "_inherit" => vec![ExpectedType::MODEL_NAME],
+        "_inherits" => vec![ExpectedType::INHERITS],
+        // An order on the model whose class body contains the assignment
+        "_order" => {
+            let scope = get_and_build_scope(session, file, value.range().start().to_u32(), true);
+            features_utils::order_model_class(session, scope)
+                .map(ExpectedType::ORDER)
+                .into_iter()
+                .collect()
         }
+        _ => vec![],
+    }
+}
+
+fn complete_assign_stmt(
+    session: &mut SessionInfo<'_>,
+    file: SourceFileKey,
+    stmt_assign: &ruff_python_ast::StmtAssign,
+    offset: usize,
+) -> Option<CompletionResponse> {
     if offset > stmt_assign.value.range().start().to_usize() && offset <= stmt_assign.value.range().end().to_usize() {
+        let expected_type = match stmt_assign.targets.as_slice() {
+            [target] => expected_types_of_target(session, file, target, &stmt_assign.value),
+            _ => vec![],
+        };
         return complete_expr( &stmt_assign.value, session, file, offset, false, &expected_type);
     }
     None
@@ -197,7 +228,8 @@ fn complete_aug_assign_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey, 
 fn complete_ann_assign_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey, stmt_ann_assign: &ruff_python_ast::StmtAnnAssign, offset: usize) -> Option<CompletionResponse> {
     if let Some(expr) = stmt_ann_assign.value.as_ref()
         && offset > expr.range().start().to_usize() && offset <= expr.range().end().to_usize() {
-            return complete_expr( expr, session, file, offset, false, &[]);
+        let expected_type = expected_types_of_target(session, file, &stmt_ann_assign.target, expr);
+            return complete_expr( expr, session, file, offset, false, &expected_type);
         }
     None
 }
@@ -391,7 +423,7 @@ fn complete_expr(expr: &Expr, session: &mut SessionInfo, file: SourceFileKey, of
         Expr::If(expr_if) => complete_if_expr(session, file, expr_if, offset, is_param, expected_type),
         Expr::Dict(expr_dict) => complete_dict(session, file, expr_dict, offset, is_param, expected_type),
         Expr::Set(expr_set) => complete_set(session, file, expr_set, offset, is_param, expected_type),
-        Expr::ListComp(_) => None,
+        Expr::ListComp(expr_list_comp) => complete_list_comp(session, file, expr_list_comp, offset, is_param, expected_type),
         Expr::SetComp(_) => None,
         Expr::DictComp(_) => None,
         Expr::Generator(_) => None,
@@ -477,6 +509,7 @@ fn complete_dict(session: &mut SessionInfo, file: SourceFileKey, expr_dict: &ruf
         if offset > dict_item_key.range().start().to_usize() && offset <= dict_item_key.range().end().to_usize() {
             let expected_type= expected_type.iter().map(|e| match e {
                 ExpectedType::INHERITS => ExpectedType::MODEL_NAME,
+                &ExpectedType::RECORD_VALUES(model) | &ExpectedType::RECORD_VALUES_LIST(model) => ExpectedType::MODEL_FIELD(model),
                 _ => e.clone(),
             }).collect::<Vec<_>>();
             return Some(complete_expr( dict_item_key, session, file, offset, is_param, &expected_type));
@@ -484,9 +517,10 @@ fn complete_dict(session: &mut SessionInfo, file: SourceFileKey, expr_dict: &ruf
         if offset > dict_item.value.range().start().to_usize() && offset <= dict_item.value.range().end().to_usize() {
             // if expected type has model name, replace it with simple field
             // for _inherits completion
-            let expected_type = expected_type.iter().map(|e| match e {
-                ExpectedType::INHERITS => ExpectedType::SIMPLE_FIELD(Some(Sy!("Many2one"))),
-                _ => e.clone(),
+            let expected_type = expected_type.iter().filter_map(|e| match e {
+                ExpectedType::INHERITS => Some(ExpectedType::SIMPLE_FIELD(Some(Sy!("Many2one")))),
+                ExpectedType::RECORD_VALUES(_) | ExpectedType::RECORD_VALUES_LIST(_) => None,
+                _ => Some(e.clone()),
             }).collect::<Vec<_>>();
             return Some(complete_expr( &dict_item.value, session, file, offset, is_param, &expected_type));
         }
@@ -496,12 +530,26 @@ fn complete_dict(session: &mut SessionInfo, file: SourceFileKey, expr_dict: &ruf
 
 fn complete_set(session: &mut SessionInfo, file: SourceFileKey, expr_set: &ruff_python_ast::ExprSet, offset: usize, is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
     let set_item = expr_set.elts.iter().find(|set_item| offset > set_item.range().start().to_usize() && offset <= set_item.range().end().to_usize())?;
-    // A set expression here is just starting to write the inherits dict
+    // A set expression here is just starting to write the inherits dict, or a dict of record values
     let expected_type= expected_type.iter().map(|e| match e {
         ExpectedType::INHERITS => ExpectedType::MODEL_NAME,
+        &ExpectedType::RECORD_VALUES(model) | &ExpectedType::RECORD_VALUES_LIST(model) => ExpectedType::MODEL_FIELD(model),
         _ => e.clone(),
     }).collect::<Vec<_>>();
     complete_expr(set_item, session, file, offset, is_param, &expected_type)
+}
+
+fn complete_list_comp(session: &mut SessionInfo, file: SourceFileKey, expr_list_comp: &ruff_python_ast::ExprListComp, offset: usize, is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
+    // Currently only the item of a list of ExpectedType::RECORD_VALUES_LIST is completed
+    // TODO: Handle all list comp completions
+    let expected_type = expected_type.iter().filter_map(|e| match e {
+        &ExpectedType::RECORD_VALUES_LIST(model) => Some(ExpectedType::RECORD_VALUES(model)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    if expected_type.is_empty() || !(offset > expr_list_comp.elt.range().start().to_usize() && offset <= expr_list_comp.elt.range().end().to_usize()) {
+        return None;
+    }
+    complete_expr(&expr_list_comp.elt, session, file, offset, is_param, &expected_type)
 }
 
 fn complete_yield(session: &mut SessionInfo, file: SourceFileKey, expr_yield: &ExprYield, offset: usize, is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
@@ -537,8 +585,7 @@ fn complete_decorator_call(
     if decorator_args.args.is_empty(){
         return None; // All the decorators we handle have at least one arg for now
     }
-    let scope = session.st().get_scope_symbol(file, offset as u32, false);
-    AstUtils::build_scope(session, scope);
+    let scope = get_and_build_scope(session, file, offset as u32, false);
     let dec_evals = Evaluation::eval_from_ast(session, decorator_base, scope, max_infer, false, &mut vec![]).0;
     let mut followed_evals = vec![];
     for eval in dec_evals {
@@ -553,19 +600,12 @@ fn complete_decorator_call(
         let Some(dec_sym) = decorator_eval_sym_weak.weak.upgrade(session.st()) else {
             continue;
         };
-        let dec_sym_tree = session.st().get_tree(dec_sym);
-        let is_18_1_or_later = session.sync_odoo.version >= (18, 1);
-        let expected_types = if (!is_18_1_or_later && dec_sym_tree.0.ends_with_strs(&["odoo", "api"])) ||
-                (is_18_1_or_later && dec_sym_tree.0.ends_with_strs(&["odoo", "orm", "decorators"])) {
-            if (dec_sym_tree.1 == ["onchange"] || dec_sym_tree.1 == ["constrains"]) && SyncOdoo::is_in_main_entry(session, &dec_sym_tree.0) {
+        let expected_types = match features_utils::classify_api_decorator(session, dec_sym) {
+            Some(ApiDecorator::Onchange | ApiDecorator::Constrains) => {
                 &[ExpectedType::SIMPLE_FIELD(None)]
-            } else if dec_sym_tree.1 == ["depends"] && SyncOdoo::is_in_main_entry(session, &dec_sym_tree.0){
-                &[ExpectedType::NESTED_FIELD(None)]
-            } else {
-                continue;
             }
-        } else {
-            continue;
+            Some(ApiDecorator::Depends) => &[ExpectedType::NESTED_FIELD(None)],
+            None => continue,
         };
         // if dec_sym_tree == (vec![S!("odoo"), S!("api")], vec![S!("returns")]){
         //     // Todo
@@ -583,151 +623,109 @@ fn complete_call(session: &mut SessionInfo, file: SourceFileKey, expr_call: &ruf
     if offset > expr_call.func.range().start().to_usize() && offset <= expr_call.func.range().end().to_usize() {
         return complete_expr( &expr_call.func, session, file, offset, is_param, expected_type);
     }
-    let scope = session.st().get_scope_symbol(file, offset as u32, is_param);
+    let scope = get_and_build_scope(session, file, offset as u32, is_param);
     let from_module = session.st().find_module(file);
-    AstUtils::build_scope(session, scope);
     let callable_evals = Evaluation::eval_from_ast(session, &expr_call.func, scope, &expr_call.func.range().start(), false, &mut vec![]).0;
     let callable_eval_sym_ptrs = callable_evals.iter().flat_map(|callable_eval|
         SymbolTable::follow_ref(&callable_eval.symbol.get_symbol(session, None, &mut vec![], None), session, None, false, false, None, None)
     ).collect::<Vec<_>>();
-    if let Some((arg_index, arg)) = expr_call.arguments.args.iter().find_position(|arg|
+    let (arg_index, value, keyword_name) = if let Some((index, arg)) = expr_call.arguments.args.iter().find_position(|arg|
         offset > arg.range().start().to_usize() && offset <= arg.range().end().to_usize())
     {
-        for callable_eval in callable_eval_sym_ptrs.iter() {
-            let EvaluationSymbolPtr::WEAK(callable) = callable_eval else {
-                continue;
-            };
-            let Some(callable_sym) = callable.weak.upgrade(session.st())  else {continue};
-            if ![SymType::FUNCTION, SymType::CLASS].contains(&callable_sym.typ()){
-                continue;
-            }
-            if callable_sym.typ() == SymType::CLASS
-                && arg_index == 0
-            {
-                // Relational fields first argument is a model name.
-                if SymbolTable::is_specific_field_class(session, callable_sym, &["Many2one", "One2many", "Many2many"]) {
-                    return complete_expr(arg, session, file, offset, is_param, &[ExpectedType::MODEL_NAME]);
-                }
-                // Selection and Reference fields first argument is a method name.
-                if SymbolTable::is_specific_field_class(session, callable_sym, &["Selection", "Reference"]) {
-                    return complete_expr(arg, session, file, offset, is_param, &[ExpectedType::METHOD_NAME]);
-                }
-            }
-            // if class get __init__ method, we need to get the argument from there
-            let func_key = if callable_sym.typ() == SymType::CLASS {
-                if let Some(&SymbolKey::Function(init_method)) = SymbolTable::get_member_symbol(session, callable_sym, "__init__", from_module, false, false, true, false, false).0.first() {
-                    init_method
-                } else {
-                    continue;
-                }
-            } else {
-                callable_sym.unwrap_function_key()
-            };
-            let is_on_instance = if callable_sym.typ() == SymType::CLASS {
-                Some(true)
-            } else {
-                callable.context.get(ContextKey::IsAttrOfInstance).map(|v| v.as_bool())
-            };
-            let Some(func_arg_sym) = FunctionSymbol::get_indexed_arg_in_call(
-                session.st(),
-                func_key,
-                expr_call,
-                arg_index as u32,
-                is_on_instance)
-                .and_then(|func_arg| func_arg.symbol.upgrade(session.st())) else {
-                continue;
-            };
-            let mut expected_type = vec![];
-            if session.st()[func_arg_sym].name == "inverse_name"
-                && callable_sym.typ() == SymType::CLASS
-                && SymbolTable::is_specific_field_class(session, callable_sym, &["One2many"]) {
-                let comodel_name_option = match expr_call.arguments.args.first() {
-                    Some(Expr::StringLiteral(expr)) => Some(ExpectedType::EXTERNAL_FIELD(Sy!(expr.value.to_string()))),
-                    _ => expr_call
-                        .arguments
-                        .keywords
-                        .iter()
-                        .find(|kw|
-                            kw.arg.as_ref().map(|arg| arg.id == "comodel_name").unwrap_or(false)
-                        )
-                        .and_then(|kw| match &kw.value {
-                            Expr::StringLiteral(expr) => Some(ExpectedType::EXTERNAL_FIELD(Sy!(expr.value.to_string()))),
-                            _ => None
-                        })
-                };
-                if let Some(comodel_name) = comodel_name_option {
-                    expected_type.push(comodel_name);
-                }
-            } else {
-                for evaluation in session.st()[func_arg_sym].evaluations.clone() {
-                    match evaluation.symbol.get_symbol_ptr() {
-                        EvaluationSymbolPtr::WEAK(_weak) => {
-                            //if weak, use get_symbol
-                            let symbol =  evaluation.symbol.get_symbol_as_weak(session, None, &mut vec![], None);
-                            if let Some(evaluation) = symbol.weak.upgrade(session.st())
-                                && let SymbolKey::Class(class) = evaluation {
-                                    expected_type.push(ExpectedType::CLASS(class));
-                                }
-                        },
-                        EvaluationSymbolPtr::DOMAIN => {
-                            if let Some(parent) = callable.context.get(ContextKey::BaseAttr)
-                                .and_then(|parent_value| parent_value.as_symbol().upgrade(session.st())) {
-                                expected_type.push(ExpectedType::DOMAIN(parent));
-                            }
-                            return complete_expr(arg, session, file, offset, is_param, &expected_type);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            return complete_expr(arg, session, file, offset, is_param, &expected_type);
-        }
-        //if we didn't find anything, still try to complete
-        return complete_expr(arg, session, file, offset, is_param, &[]);
-    }
-    let keyword = expr_call.arguments.keywords.iter().find(|arg| {
-        offset > arg.range().start().to_usize() && offset <= arg.range().end().to_usize()
-    })?;
-    for callable_eval_sym_ptr in callable_eval_sym_ptrs.iter() {
-        let callable_option = callable_eval_sym_ptr.upgrade_weak(session.st());
-        let Some(callable_sym) = callable_option else {continue};
-        if callable_sym.typ() != SymType::CLASS || !SymbolTable::is_field_class(session, callable_sym){
-            continue;
-        }
-        let Some(expected_type) = keyword.arg.as_ref().and_then(|kw_arg_id|
-            match kw_arg_id.id.as_str() {
-                "related" => Some(vec![ExpectedType::NESTED_FIELD(Some(session.st().name(callable_sym).clone()))]),
-                "comodel_name" => if SymbolTable::is_specific_field_class(session, callable_sym, &["Many2one", "One2many", "Many2many"]) {
-                        Some(vec![ExpectedType::MODEL_NAME])
-                    } else {
-                        None
-                    },
-                "inverse_name" => {
-                    if let Some(Expr::StringLiteral(expr)) = expr_call.arguments.args.first() {
-                        Some(vec![ExpectedType::EXTERNAL_FIELD(Sy!(expr.value.to_string()))])
-                    } else {
-                        expr_call.arguments.keywords.iter().find(|kw| kw.arg.as_ref().map(|arg| arg.id == "comodel_name").unwrap_or(false))
-                        .and_then(|kw| match &kw.value {
-                            Expr::StringLiteral(expr) => Some(vec![ExpectedType::EXTERNAL_FIELD(Sy!(expr.value.to_string()))]),
-                            _ => None
-                        })
-                    }
-                },
-                "inverse" | "search" | "compute" | "group_expand" | "selection" => Some(vec![ExpectedType::METHOD_NAME]),
-                "compute_sql" if session.sync_odoo.version >= (19, 1) => Some(vec![ExpectedType::METHOD_NAME]),
-                "init_storage" if session.sync_odoo.version >= (20, 0) => Some(vec![ExpectedType::METHOD_NAME]),
-                "depends" => Some(vec![ExpectedType::NESTED_FIELD(None)]),
-                _ => None,
-            }
-        ) else {
+        (index, arg, None)
+    } else {
+        let (index, keyword) = expr_call.arguments.keywords.iter().find_position(|keyword|
+            offset > keyword.range().start().to_usize() && offset <= keyword.range().end().to_usize())?;
+        // `**kwargs` has no name, so it matches no parameter. Complete it without an expected type
+        let Some(name) = keyword.arg.as_ref() else {
+            return complete_expr(&keyword.value, session, file, offset, is_param, &[]);
+        };
+        (
+            expr_call.arguments.args.len() + index,
+            &keyword.value,
+            Some(name.id.as_str()),
+        )
+    };
+    // Collect the expected types from all the callables, e.g. an override and its base method
+    let mut expected_type = vec![];
+    for callable_eval in callable_eval_sym_ptrs.iter() {
+        let EvaluationSymbolPtr::WEAK(callable) = callable_eval else {
             continue;
         };
-        return complete_expr(&keyword.value, session, file, offset, is_param, &expected_type);
+        let Some(callable_sym) = callable.weak.upgrade(session.st())  else {continue};
+        if ![SymType::FUNCTION, SymType::CLASS].contains(&callable_sym.typ()){
+            continue;
+        }
+        let param = features_utils::find_call_param(
+            session,
+            from_module,
+            callable,
+            callable_sym,
+            expr_call,
+            arg_index,
+        );
+        let model = features_utils::model_called_on(session, callable);
+        // If a callable has a special argument (e.g. the base method), use its expected type and ignore the others
+        if let Some(special_expected_type) =
+            SpecialArg::classify_call_argument(session, callable_sym, param, keyword_name).and_then(
+                |special_arg| {
+                    expected_type_of(session, special_arg, model, callable_sym, expr_call)
+                },
+            )
+        {
+            return complete_expr(
+                value,
+                session,
+                file,
+                offset,
+                is_param,
+                &[special_expected_type],
+            );
+        }
+        let Some(param) = param else {
+            continue;
+        };
+        for evaluation in session.st()[param].evaluations.clone() {
+            let symbol = evaluation
+                .symbol
+                .get_symbol_as_weak(session, None, &mut vec![], None);
+            if let Some(SymbolKey::Class(class)) = symbol.weak.upgrade(session.st()) {
+                expected_type.push(ExpectedType::CLASS(class));
+            }
+        }
     }
-    complete_expr(&keyword.value, session, file, offset, is_param, &[])
+    complete_expr(value, session, file, offset, is_param, &expected_type)
 }
 
-fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_string_literal: &ruff_python_ast::ExprStringLiteral, _offset: usize, _is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
+/// Returns the expected type of a string in the special argument `special_arg` of `callable_sym`,
+/// called on `model`.
+fn expected_type_of(
+    session: &SessionInfo,
+    special_arg: SpecialArg,
+    model: Option<ModelSymbolKey>,
+    callable_sym: SymbolKey,
+    expr_call: &ruff_python_ast::ExprCall,
+) -> Option<ExpectedType> {
+    match special_arg {
+        SpecialArg::Domain => model.map(|model| ExpectedType::DOMAIN(model.into())),
+        SpecialArg::Order => model?.as_class_key().map(ExpectedType::ORDER),
+        SpecialArg::Field(FieldParam::Comodel) => Some(ExpectedType::MODEL_NAME),
+        // The related path must end on a field of the same type as the field class
+        SpecialArg::Field(FieldParam::Related) => Some(ExpectedType::NESTED_FIELD(Some(
+            session.st().name(callable_sym).clone(),
+        ))),
+        SpecialArg::Field(FieldParam::Depends) => Some(ExpectedType::NESTED_FIELD(None)),
+        SpecialArg::Field(FieldParam::InverseField) => {
+            features_utils::field_comodel_name(expr_call)
+                .map(|comodel_name| ExpectedType::EXTERNAL_FIELD(Sy!(comodel_name.to_string())))
+        }
+        SpecialArg::Field(FieldParam::ModelMethod) => Some(ExpectedType::METHOD_NAME),
+        SpecialArg::RecordValuesList => model.map(ExpectedType::RECORD_VALUES_LIST),
+        SpecialArg::RecordValues => model.map(ExpectedType::RECORD_VALUES),
+    }
+}
+
+fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_string_literal: &ruff_python_ast::ExprStringLiteral, offset: usize, _is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
     let mut items = vec![];
     let current_module = session.st().find_module(file);
     for expected_type in expected_type.iter() {
@@ -838,14 +836,13 @@ fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_
             ExpectedType::DOMAIN_FIELD(parent) => {
                 add_nested_field_names(session, &mut items, current_module, expr_string_literal.value.to_str(), *parent, true, &None);
             },
-            ExpectedType::SIMPLE_FIELD(_) | ExpectedType::NESTED_FIELD(_) | ExpectedType::METHOD_NAME => 'field_block:  {
-                let scope = session.st().get_scope_symbol(file, expr_string_literal.range().start().to_u32(), true);
-                AstUtils::build_scope(session, scope);
+            ExpectedType::SIMPLE_FIELD(_) | ExpectedType::NESTED_FIELD(_) | ExpectedType::METHOD_NAME => {
+                let scope = get_and_build_scope(session, file, expr_string_literal.range().start().to_u32(), true);
                 let Some(SymbolKey::Class(parent_class)) = session.st().get_in_parents(scope, &[SymType::CLASS], true) else {
-                    break 'field_block;
+                    continue;
                 };
                 if session.st()[parent_class]._model.is_none() {
-                    break 'field_block;
+                    continue;
                 }
                 match expected_type {
                     ExpectedType::SIMPLE_FIELD(maybe_field_type) => add_model_attributes(
@@ -868,8 +865,19 @@ fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_
                     add_model_attributes(session, &mut items, current_module, class_key.into(), false, true, false, expr_string_literal.value.to_str(), &Some(Sy!("Many2one")))
                 });
             },
+            &ExpectedType::ORDER(model_class) => complete_model_order(
+                session,
+                model_class,
+                expr_string_literal,
+                offset,
+                current_module,
+                &mut items,
+            ),
+            &ExpectedType::MODEL_FIELD(model) => add_model_attributes(
+                session, &mut items, current_module, model.into(), false, true, false, expr_string_literal.value.to_str(), &None),
             ExpectedType::CLASS(_) => {},
             ExpectedType::INHERITS => {},
+            ExpectedType::RECORD_VALUES(_) | ExpectedType::RECORD_VALUES_LIST(_) => {},
         }
     }
     Some(CompletionResponse::List(CompletionList {
@@ -884,8 +892,7 @@ fn complete_attribut(session: &mut SessionInfo, file: SourceFileKey, attr: &Expr
     //TODO actually using start_expr instead of offset, because when we complete an attr, like "self.", the ast is invalid, preventing any rebuild
     //As symbols are not rebuilt, boundaries are not rights, and a "return self." at the end of a function/class body would be out of scope.
     //Temporary, by using the start of expr, we can hope that it is still in the right scope.
-    let scope = session.st().get_scope_symbol(file, start_expr, is_param);
-    AstUtils::build_scope(session, scope);
+    let scope = get_and_build_scope(session, file, start_expr, is_param);
     if offset > attr.value.range().start().to_usize() && offset <= attr.value.range().end().to_usize() {
         return complete_expr( &attr.value, session, file, offset, is_param, expected_type);
     } else {
@@ -911,8 +918,7 @@ fn complete_attribut(session: &mut SessionInfo, file: SourceFileKey, attr: &Expr
 }
 
 fn complete_subscript(session: &mut SessionInfo, file: SourceFileKey, expr_subscript: &ExprSubscript, offset: usize, is_param: bool, _expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
-    let scope = session.st().get_scope_symbol(file, offset as u32, is_param);
-    AstUtils::build_scope(session, scope);
+    let scope = get_and_build_scope(session, file, offset as u32, is_param);
     let subscripted = Evaluation::eval_from_ast(session, &expr_subscript.value, scope, &expr_subscript.value.range().start(), false, &mut vec![]).0;
     for eval in subscripted.iter() {
         let eval_symbol = eval.symbol.get_symbol(session, None, &mut vec![], Some(scope));
@@ -946,8 +952,7 @@ fn complete_name_expression(session: &mut SessionInfo, file: SourceFileKey, expr
 }
 
 fn complete_name(session: &mut SessionInfo, file: SourceFileKey, offset: usize, is_param: bool, name: &str) -> Option<CompletionResponse> {
-    let scope = session.st().get_scope_symbol(file, offset as u32, is_param);
-    AstUtils::build_scope(session, scope);
+    let scope = get_and_build_scope(session, file, offset as u32, is_param);
     let symbols = session.st().get_all_inferred_names(scope, name, offset as u32);
     Some(CompletionResponse::List(CompletionList {
         is_incomplete: false,
@@ -1028,8 +1033,36 @@ fn complete_list_or_tuple(session: &mut SessionInfo, file: SourceFileKey, list_o
                 }
             }
             ExpectedType::NESTED_FIELD(field_type) => {
-                if let Some(Expr::StringLiteral(expr_string_literal)) = list_or_tuple_elts.iter().find(|expr| offset > expr.range().start().to_usize() && offset <= expr.range().end().to_usize()) {
-                    return complete_string_literal(session, file, expr_string_literal, offset, is_param, &[ExpectedType::NESTED_FIELD(field_type.clone())]);
+                if let Some(Expr::StringLiteral(expr_string_literal)) =
+                    list_or_tuple_elts.iter().find(|expr| {
+                        offset > expr.range().start().to_usize()
+                            && offset <= expr.range().end().to_usize()
+                    })
+                {
+                    return complete_string_literal(
+                        session,
+                        file,
+                        expr_string_literal,
+                        offset,
+                        is_param,
+                        &[ExpectedType::NESTED_FIELD(field_type.clone())],
+                    );
+                }
+            }
+            &ExpectedType::RECORD_VALUES_LIST(model) => {
+                // Each item is a dict of values
+                if let Some(expr) = list_or_tuple_elts.iter().find(|expr| {
+                    offset > expr.range().start().to_usize()
+                        && offset <= expr.range().end().to_usize()
+                }) {
+                    return complete_expr(
+                        expr,
+                        session,
+                        file,
+                        offset,
+                        is_param,
+                        &[ExpectedType::RECORD_VALUES(model)],
+                    );
                 }
             }
             _ => {}
@@ -1215,7 +1248,7 @@ fn build_completion_item_from_symbols(session: &mut SessionInfo, symbols: Vec<Sy
     let type_details = sym_evals
         .into_iter()
         .map(|(eval, symbol_type)| {
-            FeaturesUtils::get_inferred_types(session, &eval, Some(&context_of_symbol), symbol_type)
+            features_utils::get_inferred_types(session, &eval, Some(&context_of_symbol), symbol_type)
         })
         .unique()
         .collect::<Vec<_>>();
@@ -1240,7 +1273,7 @@ fn build_completion_item_from_symbols(session: &mut SessionInfo, symbols: Vec<Sy
         documentation: Some(
             lsp_types::Documentation::MarkupContent(MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
-                value: FeaturesUtils::build_markdown_description(session, None, None, &symbols.iter().map(|&symbol|
+                value: features_utils::build_markdown_description(session, None, None, &symbols.iter().map(|&symbol|
                     Evaluation {
                         symbol: EvaluationSymbol::new_with_symbol(symbol.into(), None,
                             context_of_symbol.clone(),
@@ -1302,4 +1335,129 @@ fn get_completion_item_kind(typ: &SymType) -> CompletionItemKind {
         SymType::XML_DELETE => CompletionItemKind::CONSTANT,
         SymType::JS_FILE => CompletionItemKind::FILE,
     }
+}
+
+/// Complete an order on `model_class`, e.g. `_order = "name desc nulls last, partner_id.id"`.
+/// Offers a field, the `id` of a many2one, or the direction and nulls keywords,
+/// depending on the word of the item under the cursor.
+fn complete_model_order(
+    session: &mut SessionInfo,
+    model_class: ClassKey,
+    order_string: &ruff_python_ast::ExprStringLiteral,
+    offset: usize,
+    current_module: Option<ModuleKey>,
+    items: &mut Vec<CompletionItem>,
+) {
+    let order = order_string.value.to_str();
+    // No completion outside the string, between its parts, or in a part with escapes
+    let Some(cursor) = AstUtils::index_in_string(order_string, TextSize::new(offset as u32)) else {
+        return;
+    };
+    let Some(item) = OrderItem::order_items(order)
+        .into_iter()
+        .find(|item| item.contains(cursor))
+    else {
+        return;
+    };
+    // Split the words of the item before the cursor into the typed ones and the one being typed
+    let before_cursor = &order[item.start..cursor];
+    let (typed, current) = before_cursor
+        .rsplit_once(char::is_whitespace)
+        .unwrap_or(("", before_cursor));
+    let typed: Vec<&str> = typed.split_whitespace().collect();
+    match typed.split_first() {
+        // Typing the field (`<current>`) or its property (`<field>.<current>`)
+        None => match current.split_once('.') {
+            Some((field, property)) => {
+                add_order_property(session, items, current_module, model_class, field, property)
+            }
+            None => add_model_attributes(
+                session,
+                items,
+                current_module,
+                model_class.into(),
+                false,
+                true,
+                false,
+                current,
+                &None,
+            ),
+        },
+        // Typing a keyword after the field (`<field> <keywords> <current>`).
+        // `nulls` is offered together with where nulls go, e.g. `nulls last`
+        Some((_field, keywords)) => {
+            let next: Vec<&str> = OrderItem::next_keywords(keywords)
+                .iter()
+                .flat_map(|&keyword| {
+                    if keyword == "nulls" {
+                        vec!["nulls first", "nulls last"]
+                    } else {
+                        vec![keyword]
+                    }
+                })
+                .collect();
+            add_order_keywords(items, &next, current);
+        }
+    }
+}
+
+/// Offer the `id` of the many2one `field`, the only property an order accepts, e.g. `partner_id.id`.
+fn add_order_property(
+    session: &mut SessionInfo,
+    items: &mut Vec<CompletionItem>,
+    current_module: Option<ModuleKey>,
+    parent_class: ClassKey,
+    field: &str,
+    property: &str,
+) {
+    if !"id".starts_with(property) {
+        return;
+    }
+    let mut walker = DeepFieldEvalWalker::new(parent_class.into(), current_module);
+    let Some(model) = walker.get_model_symbol(session) else {
+        return;
+    };
+    let _ = walker.get_model_fields(session, model, field);
+    if !walker.last_field_is_many2one(session) {
+        return;
+    }
+    let Some(comodel) = walker.get_model_symbol(session) else {
+        return;
+    };
+    if let Some(&id) = walker.get_model_fields(session, comodel, "id").first() {
+        let context =
+            Context::from_iter([(ContextKey::BaseAttr, ContextValue::SYMBOL(comodel.into()))]);
+        items.push(build_completion_item_from_symbols(
+            session,
+            vec![id],
+            "id",
+            context,
+        ));
+    }
+}
+
+/// Offer the `keywords` that start with the word being typed, e.g. `desc` for `de`.
+fn add_order_keywords(items: &mut Vec<CompletionItem>, keywords: &[&str], current: &str) {
+    let current = current.to_ascii_lowercase();
+    items.extend(
+        keywords
+            .iter()
+            .filter(|keyword| keyword.starts_with(&current))
+            .map(|keyword| CompletionItem {
+                label: keyword.to_string(),
+                kind: Some(lsp_types::CompletionItemKind::KEYWORD),
+                ..Default::default()
+            }),
+    );
+}
+
+fn get_and_build_scope(
+    session: &mut SessionInfo,
+    file: impl Into<SymbolKey>,
+    offset: u32,
+    is_param: bool,
+) -> SymbolKey {
+    let scope = session.st().get_scope_symbol(file, offset, is_param);
+    AstUtils::build_scope(session, scope);
+    scope
 }

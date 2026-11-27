@@ -6,7 +6,6 @@ use crate::{
     },
     threads::SessionInfo,
 };
-
 /// Helper struct to walk through relational fields of a model in order to find the symbol of a nested field
 /// It follows the chain of relational fields using field string names
 /// It is used by alternating the call between get_model_symbol and get_model_fields,
@@ -86,18 +85,34 @@ impl DeepFieldEvalWalker {
     /// Cheaper than get_model_symbol: it does not resolve the comodel, and it is also correct
     /// for the multi-comodel case where get_model_symbol would return None.
     pub fn last_field_is_relational(&self, session: &mut SessionInfo) -> bool {
+        self.last_field_has_type(
+            session,
+            &["many2one", "many2many", "one2many"],
+            &["Many2one", "One2many", "Many2many"],
+        )
+    }
+
+    /// Returns true if any field symbol from the previous get_model_fields call is a Many2one relational field.
+    pub fn last_field_is_many2one(&self, session: &mut SessionInfo) -> bool {
+        self.last_field_has_type(session, &["many2one"], &["Many2one"])
+    }
+
+    /// Whether any field symbol from the previous get_model_fields call has one of these types.
+    /// `xml_types` are for fields defined in XML, `field_classes` for fields defined in Python.
+    fn last_field_has_type(
+        &self,
+        session: &mut SessionInfo,
+        xml_types: &[&str],
+        field_classes: &[&str],
+    ) -> bool {
         let Some(field_symbols) = &self.prev_field_symbols else {
             return false;
         };
         field_symbols.iter().any(|field_symbol_key| match field_symbol_key {
             SymbolKey::XmlRecord(key) => session.st()[*key]
                 .get_field_text(XmlFieldName::Type, session.st())
-                .is_some_and(|ttype| ["many2one", "many2many", "one2many"].contains(&ttype.as_str())),
-            SymbolKey::Variable(_) => SymbolTable::is_specific_field(
-                session,
-                *field_symbol_key,
-                &["Many2one", "One2many", "Many2many"],
-            ),
+                .is_some_and(|ttype| xml_types.contains(&ttype.as_str())),
+            SymbolKey::Variable(_) => SymbolTable::is_specific_field(session, *field_symbol_key, field_classes),
             _ => false,
         })
     }
@@ -110,29 +125,12 @@ impl DeepFieldEvalWalker {
         base_object: SymbolKey,
         name: &str,
     ) -> Vec<SymbolKey> {
-        let symbols = match base_object {
-            SymbolKey::XmlRecord(xml_record_key) => {
-                if let Some(model) = SymbolTable::get_xml_defined_model(session, xml_record_key) {
-                    session.model_mgr()[model]
-                        .get_xml_model_field_symbols(session.st(), self.from_module)
-                        .filter_map(|f_key| {
-                            let field_name = session.st()[f_key]
-                                .get_field_text(XmlFieldName::Name, session.st())?;
-                            if field_name == name {
-                                Some(SymbolKey::from(f_key))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![]
-                }
-            }
-            SymbolKey::Class(_) => {
-                let (symbols, _diagnostics) = SymbolTable::get_member_symbol(
+        let symbols = base_object
+            .as_model_symbol_key()
+            .map(|model| {
+                SymbolTable::get_member_symbol(
                     session,
-                    base_object,
+                    model.into(),
                     name,
                     self.from_module,
                     false,
@@ -140,11 +138,10 @@ impl DeepFieldEvalWalker {
                     false,
                     true,
                     false,
-                );
-                symbols
-            }
-            _ => Vec::new(),
-        };
+                )
+                .0
+            })
+            .unwrap_or_default();
         self.prev_field_symbols = Some(symbols.clone());
         symbols
     }

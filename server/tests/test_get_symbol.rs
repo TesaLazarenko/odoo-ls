@@ -344,8 +344,8 @@ fn test_definition() {
     let range_m2 = FileMgr::text_range_to_range(&mut session, &module2_test_file, range_m2);
     assert!(compute_kwarg_locs.iter().any(|loc| range_m2 == loc.target_range), "Expected _compute_something to be at the same location as the compute keyword argument in module_2");
 
-    // group_expand, selection and the first positional argument of a Selection name a method
-    for (line, column, method) in [(85, 34, "_selection_state"), (85, 67, "_expand_states"), (86, 43, "_selection_state")] {
+    // group_expand, selection and the first positional argument of a Selection or a Reference name a method
+    for (line, column, method) in [(85, 34, "_selection_state"), (85, 67, "_expand_states"), (86, 43, "_selection_state"), (97, 48, "_selection_state"), (98, 42, "_selection_state")] {
         let locs = test_utils::get_definition_locs(&mut session, m1_tf_file_symbol, m1_tf_file_info, line, column);
         assert_eq!(locs.len(), 1, "Expected 1 location for method '{method}' at {line}:{column}");
         let sym = session.st().get_symbol(m1_tf_file_symbol.into(), (&[], &["DisplayNameRelatedModel", method]), u32::MAX);
@@ -357,6 +357,9 @@ fn test_definition() {
     // The first positional argument of a Char is its label, not a method name
     let label_locs = test_utils::get_definition_locs(&mut session, m1_tf_file_symbol, m1_tf_file_info, 87, 29);
     assert!(label_locs.is_empty(), "Expected no location for the label of a Char field, got: {:?}", label_locs);
+    // A Char takes no `selection`: given by keyword, it is not a method name either
+    let note_locs = test_utils::get_definition_locs(&mut session, m1_tf_file_symbol, m1_tf_file_info, 88, 38);
+    assert!(note_locs.is_empty(), "Expected no location for the `selection` of a Char field, got: {:?}", note_locs);
 
     // Now test go to def of `partner_id.country_id.phone_code` on each field.
     let partner_id_locs = test_utils::get_definition_locs(&mut session, m1_tf_file_symbol, m1_tf_file_info, 33, 25);
@@ -1252,6 +1255,115 @@ fn test_decoded_values_vs_source_offsets() {
     }
 
     assert!(failures.is_empty(), "Decoded values vs source offsets:\n{}", failures.join("\n"));
+}
+
+/// Hover and definition on each field of `_order = 'other_id desc, name, id,'` lead where `self.<field>` does.
+/// A direction gets nothing.
+#[test]
+fn test_model_order_fields() {
+    let (mut odoo, config) = setup::setup::setup_server(true);
+    let test_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("addons")
+        .join("module_semantic_tokens")
+        .join("models")
+        .join("sem_tokens_main.py")
+        .sanitize();
+    let mut session = setup::setup::create_init_session(&mut odoo, config);
+    let main = Fixture::open(&mut session, &test_file);
+    let mut failures = vec![];
+
+    // (case, `self.<field>` as control, position in `_order`)
+    let cases = [
+        ("other_id", main.position(70, "other_id", 0), main.position(98, "other_id", 7)),
+        ("name", main.position(69, "name", 0), main.position(98, "name", 3)),
+        // A field split between the parts of `'other_' 'id'` is found from either part
+        ("split field, first part", main.position(70, "other_id", 0), main.position(104, "'other_'", 1)),
+        ("split field, second part", main.position(70, "other_id", 0), main.position(104, "'id'", 1)),
+        // `.id` is a property of `other_record`, so the `id` field of its comodel, like a plain `id`
+        ("field with a property", main.position(110, "other_record", 0), main.position(112, "other_record", 3)),
+        ("property", main.position(98, ", id", 2), main.position(112, ".id", 1)),
+        ("annotated assignment", main.position(70, "other_id", 0), main.position(118, "other_id", 0)),
+    ];
+    for (case, control, position) in cases {
+        catch(&mut failures, case, || {
+            let mut problems = vec![];
+            let control_targets = main.definition(&mut session, control);
+            let targets = main.definition(&mut session, position);
+            if control_targets.is_empty() || targets != control_targets {
+                problems.push(format!(
+                    "definition should be {:?}, got: {:?}",
+                    control_targets, targets
+                ));
+            }
+            if main.hover(&mut session, position).is_empty() {
+                problems.push("expected a hover".to_string());
+            }
+            problems
+        });
+    }
+    // `id` is also found inside `other_id`, so the one after it must still resolve
+    catch(&mut failures, "id", || {
+        let targets = main.definition(&mut session, main.position(98, ", id", 2));
+        if targets.is_empty() {
+            vec!["expected a definition".to_string()]
+        } else {
+            vec![]
+        }
+    });
+    catch(&mut failures, "direction", || {
+        let targets = main.definition(&mut session, main.position(98, "desc", 0));
+        if targets.is_empty() {
+            vec![]
+        } else {
+            vec![format!("expected no definition, got: {:?}", targets)]
+        }
+    });
+    // Not a model's `_order`, e.g. a plain class attribute or a local variable in a method
+    for (case, line) in [("plain class", 123), ("method local", 131)] {
+        catch(&mut failures, case, || {
+            let targets = main.definition(&mut session, main.position(line, "other_id", 0));
+            if targets.is_empty() {
+                vec![]
+            } else {
+                vec![format!("expected no definition, got: {:?}", targets)]
+            }
+        });
+    }
+    // A model name in `_order` resolves to the model, as in any string (`self.env['sem.tokens.other']` as
+    // control), except in a model's `_order`
+    let control_targets = main.definition(&mut session, main.position(80, "sem.tokens.other", 0));
+    for (case, line) in [
+        ("model name, plain class", 136),
+        ("model name, method local", 144),
+    ] {
+        catch(&mut failures, case, || {
+            let targets = main.definition(&mut session, main.position(line, "sem.tokens.other", 0));
+            if !control_targets.is_empty() && targets == control_targets {
+                vec![]
+            } else {
+                vec![format!(
+                    "definition should be {:?}, got: {:?}",
+                    control_targets, targets
+                )]
+            }
+        });
+    }
+    catch(&mut failures, "model name, model's `_order`", || {
+        let targets = main.definition(&mut session, main.position(150, "sem.tokens.other", 0));
+        if targets.is_empty() {
+            vec![]
+        } else {
+            vec![format!("expected no definition, got: {:?}", targets)]
+        }
+    });
+
+    assert!(
+        failures.is_empty(),
+        "`_order` fields:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Hover and definition at `position` must match the control's.

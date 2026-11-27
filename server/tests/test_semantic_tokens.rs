@@ -52,6 +52,7 @@ fn test_semantic_tokens_python() {
     check_names_left_to_the_grammar(&main);
     check_decorators_left_to_the_grammar(&main);
     check_model_string_tokens(&main);
+    check_inverse_name_tokens(&main);
     check_field_path_string_tokens(&main);
     check_xml_id_string_tokens(&main);
     check_import_shim_tokens(&main);
@@ -60,6 +61,7 @@ fn test_semantic_tokens_python() {
     check_concatenated_field_path_tokens(&main);
     check_quoted_field_path_tokens(&main);
     check_escaped_field_path_tokens(&main);
+    check_model_order_tokens(&main);
     check_non_ascii_concatenated_tokens(&non_ascii);
 }
 
@@ -161,6 +163,15 @@ fn check_model_string_tokens(main: &TokenFile) {
     check(main, 29, "'sem.tokens.usage'", Some((CLASS, &[])));
     check(main, 33, "'sem.tokens.other'", Some((CLASS, &[])));
     check(main, 80, "'sem.tokens.other'", Some((CLASS, &[])));
+    // The comodel given by keyword, as by position
+    check(main, 156, "'sem.tokens.other'", Some((CLASS, &[])));
+}
+
+/// The inverse of a One2many is a field of its comodel, coloured over the whole literal, quotes
+/// included; other fields take no inverse.
+fn check_inverse_name_tokens(main: &TokenFile) {
+    check(main, 157, "'other_id'", Some((PROPERTY, &[])));
+    check(main, 159, "'other_name'", None);
 }
 
 /// Field paths are coloured per dotted segment, past the quote; a method named by `compute=`
@@ -197,6 +208,30 @@ fn check_quoted_field_path_tokens(main: &TokenFile) {
 fn check_escaped_field_path_tokens(main: &TokenFile) {
     check_exact_or_none(main, 95, "other_id", (PROPERTY, &[]));
     check_exact_or_none(main, 95, "other_name", (PROPERTY, &[]));
+}
+
+/// `_order` colours the field of each comma-separated item, not its direction.
+/// `id` is also found inside `other_id`, so it must be coloured after it, not over it.
+fn check_model_order_tokens(main: &TokenFile) {
+    check(main, 98, "other_id", Some((PROPERTY, &[])));
+    check(main, 98, "name", Some((PROPERTY, &[])));
+    check(main, 98, "desc", None);
+    // A field split between the parts of `'other_' 'id'` is not found in the file, so no token
+    check(main, 104, "'other_'", None);
+    check(main, 104, "'id'", None);
+    // `.id` is a property of `other_record`, so the `id` field of its comodel
+    check(main, 112, "other_record", Some((PROPERTY, &[])));
+    check(main, 112, "id", Some((PROPERTY, &[])));
+    // An annotated assignment is coloured like `_order = ...`
+    check(main, 118, "other_id", Some((PROPERTY, &[])));
+    check(main, 118, "desc", None);
+    // Not a model's `_order`, e.g. a plain class attribute or a local variable in a method
+    check(main, 123, "other_id", None);
+    check(main, 131, "other_id", None);
+    // A model name in `_order` is coloured as a model like in any string, except in a model's `_order`
+    check(main, 136, "'sem.tokens.other'", Some((CLASS, &[])));
+    check(main, 144, "'sem.tokens.other'", Some((CLASS, &[])));
+    check(main, 150, "sem.tokens.other", None);
 }
 
 /// A non-ASCII comment between concatenated parts: no segment may end inside one of its
@@ -236,10 +271,52 @@ fn check_manifest_module_strings(manifest: &TokenFile) {
 }
 
 /// Only the arguments of a call take its context, its callee keeps the one around the call: the
-/// path in the callee of `strip()` is still the value of `related`, as hover and definition see it.
+/// path in the callee of `strip()` is in the `related` argument, but not its value, so no field.
 fn check_call_context_tokens(calls: &TokenFile) {
-    check(calls, 10, "other_id", Some((PROPERTY, &[])));
-    check(calls, 10, "other_name", Some((PROPERTY, &[])));
+    check(calls, 10, "other_id", None);
+    check(calls, 10, "other_name", None);
+    // A domain given to `search` by keyword is resolved as one given by position
+    check(calls, 14, "other_id", Some((PROPERTY, &[])));
+    check(calls, 14, "other_name", Some((PROPERTY, &[])));
+    // The order of a search method colours the fields of the model searched, by keyword or by position
+    check(calls, 18, "other_id", Some((PROPERTY, &[])));
+    check(calls, 18, "desc", None);
+    check(calls, 18, "name", Some((PROPERTY, &[])));
+    check(calls, 19, "other_id", Some((PROPERTY, &[])));
+    check(calls, 20, "other_name", Some((PROPERTY, &[])));
+    check(calls, 22, "mirrored", None);
+    // An override that takes the order in `**kwargs` or `*args`. The base method declares it
+    check(calls, 33, "other_id", Some((PROPERTY, &[])));
+    check(calls, 34, "name", Some((PROPERTY, &[])));
+    // The domain of the other search methods colours the fields of the model searched, by position or by keyword
+    check(calls, 42, "other_id", Some((PROPERTY, &[])));
+    check(calls, 42, "other_name", Some((PROPERTY, &[])));
+    check(calls, 43, "other_id", Some((PROPERTY, &[])));
+    check(calls, 44, "other_id", Some((PROPERTY, &[])));
+    check(calls, 44, "other_name", Some((PROPERTY, &[])));
+    // The domain of the other methods taking one colours the fields of the model they are called on
+    check(calls, 48, "other_id", Some((PROPERTY, &[])));
+    check(calls, 48, "other_name", Some((PROPERTY, &[])));
+    check(calls, 49, "other_id", Some((PROPERTY, &[])));
+    check(calls, 50, "other_id", Some((PROPERTY, &[])));
+    check(calls, 50, "other_name", Some((PROPERTY, &[])));
+    // The keys of the values given to create, write or update colour the fields of the model they are
+    // called on over the whole literal, as a field name, not the values
+    check(calls, 58, "'name'", Some((PROPERTY, &[])));
+    check(calls, 58, "'other_id'", None);
+    check(calls, 59, "'other_id'", Some((PROPERTY, &[])));
+    check(calls, 59, "'total'", Some((PROPERTY, &[])));
+    check(calls, 60, "'name'", Some((PROPERTY, &[])));
+    check(calls, 61, "'other_id'", Some((PROPERTY, &[])));
+    check(calls, 62, "'total'", Some((PROPERTY, &[])));
+    check(calls, 63, "'other_name'", Some((PROPERTY, &[])));
+    // `write` takes no list of values, and the update of a dict names nothing
+    check(calls, 65, "'name'", None);
+    check(calls, 66, "'name'", None);
+    // The values given by keyword name fields too
+    check(calls, 70, "'name'", Some((PROPERTY, &[])));
+    check(calls, 71, "'other_id'", Some((PROPERTY, &[])));
+    check(calls, 72, "'total'", Some((PROPERTY, &[])));
 }
 
 /// One decoded semantic token: absolute position, and the legend entries its indices name.
