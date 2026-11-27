@@ -89,7 +89,12 @@ pub fn test_ols05000s_xml_file(mut session: SessionInfo) {
     check_xml_diag("OLS05065", 115);
     check_xml_diag("OLS05066", 118);
     check_xml_diag("OLS05067", 119);
-    check_xml_warning("OLS05068", 121);
+    if session.sync_odoo.version >= (18, 2) {
+        check_xml_warning("OLS05068", 121);
+    } else {
+        // no translations of a field before 18.2: `name@nl_WV` is a field the model does not have
+        check_xml_diag("OLS05057", 121);
+    }
     check_xml_warning("OLS05076", 123);
     assert!(diag_on_line(&bikes_xml_diagnostics, 126).is_empty());
     assert!(diag_on_line(&bikes_xml_diagnostics, 127).is_empty());

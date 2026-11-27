@@ -81,6 +81,10 @@ pub fn test_self_returning_chain_hooks(mut session: SessionInfo) {
 
 //Test self.env.registry hook
 pub fn test_registry_hooks(mut session: SessionInfo) {
+    // the Registry class in odoo.orm.registry
+    if common::skip_before(&session, (18, 1), "test_registry_hooks") {
+        return;
+    }
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let test_file = test_addons_path.join("module_1").join("models").join("arch_eval_hooks_model.py").sanitize();
 
@@ -161,6 +165,10 @@ pub fn test_ids_and_id_field_hooks(mut session: SessionInfo) {
 /// alone cannot discover. The corresponding file hooks wire the top-level
 /// `odoo.<name>` attribute to the real symbol imported in `odoo/init.py`.
 pub fn test_odoo_init_symbol_hooks(mut session: SessionInfo) {
+    // odoo/init.py
+    if common::skip_before(&session, (18, 1), "test_odoo_init_symbol_hooks") {
+        return;
+    }
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let test_file = test_addons_path.join("module_1").join("models").join("arch_eval_hooks_model.py").sanitize();
 
@@ -208,6 +216,10 @@ pub fn test_odoo_init_symbol_hooks(mut session: SessionInfo) {
 /// (`odoo/addons/base/models/ir_rule.py`).
 /// Can only be tested on Odoo versions < 19.4, where the `ir.rule` model was still present.
 pub fn test_ir_rule_global_field_hook(mut session: SessionInfo) {
+    // the field classes in odoo.orm
+    if common::skip_before(&session, (18, 1), "test_ir_rule_global_field_hook") {
+        return;
+    }
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let test_file = test_addons_path.join("module_1").join("models").join("arch_eval_hooks_model.py").sanitize();
     if session.sync_odoo.version >= (19, 4) {

@@ -1,4 +1,5 @@
 use crate::core::diagnostics::{create_diag, Diag, DiagnosticCode};
+use crate::core::python_odoo_builder::MAGIC_FIELDS;
 use crate::core::symbols::SymbolTable;
 use crate::core::symbols::symbol_keys::{ModelSymbolKey, ModuleKey};
 use crate::features::features_utils::SpecialArg;
@@ -24,6 +25,11 @@ pub(crate) fn validate_record_values_arg(
             let Expr::StringLiteral(field_name) = key else {
                 continue;
             };
+            // A model defined in XML only has no class to get them from, but the registry gives the magic
+            // fields to every model (not declared in the body of BaseModel up to 18.0)
+            if matches!(model, ModelSymbolKey::XmlRecord(_)) && MAGIC_FIELDS.contains(&field_name.value.to_str()) {
+                continue;
+            }
 
             let is_empty = SymbolTable::get_member_symbol(
                 session,

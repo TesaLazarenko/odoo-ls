@@ -12,6 +12,10 @@ use crate::common::*;
 /// `not =like` and `not =ilike` exist from saas-18.2.
 /// `any!` and `not any!` are only accepted in `Domain(...)` conditions, never in a list.
 pub fn test_ols03009_version_operators(mut session: SessionInfo) {
+    // sets versions of 18.1 or later on the session, whose models are found in odoo.orm
+    if skip_before(&session, (18, 1), "test_ols03009_version_operators") {
+        return;
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/addons/module_for_diagnostics/models/domain_operators.py")
         .sanitize();

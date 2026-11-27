@@ -193,7 +193,11 @@ impl PythonOdooBuilder {
 
     fn _get_attribute(session: &mut SessionInfo, loc_sym: ClassKey, attr: &str, diagnostics: &mut Vec<Diag>) -> Option<EvaluationValue> {
         let (attr_sym, _) = SymbolTable::get_member_symbol(session, loc_sym.into(), attr, None, true, false, false, false, false);
-        let &attr_sym = attr_sym.first()?;
+        // Only an attribute declared in a class body: the ext symbols, assigned in a method (like
+        // `cls._log_access = cls._auto` in `BaseModel._build_model_attributes` up to 18.0), are set by the registry
+        // from the declared attributes, and would give their value on BaseModel to every model.
+        let &attr_sym = attr_sym.iter()
+            .find(|&&sym| session.st().parent(sym).is_some_and(|parent| matches!(parent, SymbolKey::Class(_))))?;
         for eval in session.st().evaluations(attr_sym).unwrap().clone() {
             let eval = eval.follow_ref_and_get_value(session, None, diagnostics);
             if eval.is_some() {

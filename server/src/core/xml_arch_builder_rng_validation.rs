@@ -216,10 +216,8 @@ impl XmlArchBuilder {
                 "html" | "xml" => {
                     is_xml_or_html = true;
                 }
-                "base64" | "char" | "file" => {
-                    if node.has_attribute("file") && node.text().is_some() {
-                        diagnostics.extend(create_diag(session, DiagnosticCode::OLS05021, &[], node.text_range()));
-                    }
+                "base64" | "char" | "file" if node.has_attribute("file") && node.text().is_some() => {
+                    diagnostics.extend(create_diag(session, DiagnosticCode::OLS05021, &[], node.text_range()));
                 }
                 _ => {},
             }

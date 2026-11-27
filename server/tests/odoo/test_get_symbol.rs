@@ -170,7 +170,7 @@ pub fn test_hover_on_model_field_and_method(mut session: SessionInfo) {
     // To check that the descriptor is correctly resolved
     let hover_var = common::get_hover_markdown(&mut session, file_symbol, file_info, 38, 10).unwrap_or_default();
     assert!(
-        hover_var.contains("ResPartner"),
+        hover_var.contains(common::PARTNER_CLASS_NAME(session.sync_odoo.version)),
         "Hover on variable should show type info"
     );
 
@@ -488,7 +488,8 @@ pub fn test_definition_csv(mut session: SessionInfo) {
     let country_id_loc = common::get_definition_locs(&mut session, mcsv_tf_file_symbol, mcsv_tf_file_info, 0, 8);
     assert_eq!(country_id_loc.len(), 1, "Expected 1 location for header 'country_id_loc'");
     assert_eq!(country_id_loc[0].target_uri.to_file_path().unwrap().sanitize(), path, "Expected location to be in res_country.py file");
-    let country_id_sym = session.st().get_symbol(res_country_file, (&[], &["ResCountryState", "country_id"]), u32::MAX);
+    let state_class_name = common::COUNTRY_STATE_CLASS_NAME(session.sync_odoo.version);
+    let country_id_sym = session.st().get_symbol(res_country_file, (&[], &[state_class_name, "country_id"]), u32::MAX);
     assert_eq!(country_id_sym.len(), 1, "Expected 1 symbol for country_id_sym");
     let range = session.st().range(country_id_sym[0]);
     assert_eq!(FileMgr::text_range_to_range(&mut session, &path, range), country_id_loc[0].target_range, "Expected country_id to be at the same location as the compute argument");
@@ -1236,7 +1237,12 @@ fn test_model_order_fields() {
         ("property", main.position(98, ", id", 2), main.position(112, ".id", 1)),
         ("annotated assignment", main.position(70, "other_id", 0), main.position(118, "other_id", 0)),
     ];
+    // `id` is declared in the body of BaseModel from 18.1: before, it is an implicit field, without a definition
+    let id_declared = session.sync_odoo.version >= (18, 1);
     for (case, control, position) in cases {
+        if case == "property" && !id_declared {
+            continue;
+        }
         catch(&mut failures, case, || {
             let mut problems = vec![];
             let control_targets = main.definition(&mut session, control);
@@ -1256,8 +1262,8 @@ fn test_model_order_fields() {
     // `id` is also found inside `other_id`, so the one after it must still resolve
     catch(&mut failures, "id", || {
         let targets = main.definition(&mut session, main.position(98, ", id", 2));
-        if targets.is_empty() {
-            vec!["expected a definition".to_string()]
+        if targets.is_empty() == id_declared {
+            vec![format!("expected a definition: {id_declared}, got: {:?}", targets)]
         } else {
             vec![]
         }

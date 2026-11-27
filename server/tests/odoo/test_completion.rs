@@ -245,6 +245,10 @@ pub fn test_call_argument_completion(session: &mut SessionInfo) {
 /// The operators offered in a domain leaf depend on the Odoo version.
 /// e.g. `not =like` and `not =ilike` from saas-18.2
 pub fn test_domain_operator_completion(session: &mut SessionInfo) {
+    // sets versions of 18.1 or later on the session, whose models are found in odoo.orm
+    if crate::common::skip_before(session, (18, 1), "test_domain_operator_completion") {
+        return;
+    }
     let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
     let test_file = test_addons_path.join("module_1").join("models").join("to_complete.py").sanitize();
     let content = std::fs::read_to_string(&test_file).expect("Test file does not exist");

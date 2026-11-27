@@ -49,7 +49,7 @@ use crate::{
         test_config_additional_languages_updates_diagnostics, test_language_validation,
         test_no_false_positives_from_res_lang_csv,
     },
-    test_ls::{test_import_found_again_after_rename, test_imports_after_dependency_edit, test_structure},
+    test_ls::test_structure,
     test_xml_fields::{test_xml_fields_def_hover_completion, test_xml_fields_diagnostics},
     test_references::test_references,
     test_semantic_tokens::test_semantic_tokens_python,
@@ -83,8 +83,6 @@ fn test_get_symbol() {
     let (odoo, config) = setup_server(true);
     build_once_run_isolated(odoo, config, &[
         &test_structure,
-        &test_imports_after_dependency_edit,
-        &test_import_found_again_after_rename,
         &test_hover_on_model_field_and_method,
         &test_hover_inverse_name_o2m,
         &test_hover_on_namespace_and_module,

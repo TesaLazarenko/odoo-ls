@@ -1346,6 +1346,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "csv",
+ "csv-core",
  "ctrlc",
  "dirs",
  "duplicate",

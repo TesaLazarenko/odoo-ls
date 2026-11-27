@@ -18,6 +18,27 @@ pub fn position_after(content: &str, needle: &str) -> lsp_types::Position {
     lsp_types::Position::new(line as u32, character as u32)
 }
 
+/// Whether the Odoo sources the tests run on are older than `min`, for a test written on the structure of
+/// newer versions (`odoo.orm`, `odoo.init`, a version set on the session that needs them): logs that it is skipped.
+pub fn skip_before(session: &SessionInfo, min: (u32, u32), test: &str) -> bool {
+    let skip = session.sync_odoo.version < min;
+    if skip {
+        tracing::warn!("Skipping {test}: it needs the Odoo sources of {}.{} or later, got {:?}", min.0, min.1, session.sync_odoo.version);
+    }
+    skip
+}
+
+/// Returns the correct class name for CountryState/ResCountryState depending on Odoo version
+pub static COUNTRY_STATE_CLASS_NAME: LazyLock<fn(OdooVersion) -> &'static str> = LazyLock::new(|| {
+    |version: OdooVersion| {
+        if version >= (18, 1) {
+            "ResCountryState"
+        } else {
+            "CountryState"
+        }
+    }
+});
+
 /// Returns the correct class name for Partner/ResPartner depending on Odoo version
 pub static PARTNER_CLASS_NAME: LazyLock<fn(OdooVersion) -> &'static str> = LazyLock::new(|| {
     |version: OdooVersion| {

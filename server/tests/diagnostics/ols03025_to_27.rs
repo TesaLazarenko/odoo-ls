@@ -14,6 +14,10 @@ const ACCESS_INVALID_VALUE_LINE: u32 = 26;
 const ACCESS_INVALID_FIELD_MULTI_CANDIDATE_LINE: u32 = 37;
 
 pub fn test_ols03025_to_27_access_operator(mut session: SessionInfo) {
+    // sets versions of 18.1 or later on the session, whose models are found in odoo.orm
+    if skip_before(&session, (18, 1), "test_ols03025_to_27_access_operator") {
+        return;
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/addons/module_for_diagnostics/models/access_operator.py")
         .sanitize();

@@ -146,7 +146,12 @@ impl <'a> SessionInfo<'a> {
         }
         SyncOdoo::unload_path(session, path);
         Odoo::on_new_path(session, &path.sanitize_cow());
-        if (!forced_delay || session.delayed_process_sender.is_none()) && !session.sync_odoo.need_rebuild
+        // Without the delayed processing thread (tests, --parse), nothing would process a delayed rebuild
+        if session.delayed_process_sender.is_none() {
+            BuildScheduler::process_rebuilds(session, false);
+            return;
+        }
+        if !forced_delay && !session.sync_odoo.need_rebuild
             && BuildScheduler::get_rebuild_queue_size(session) < 10 {
                 BuildScheduler::process_rebuilds(session, false);
                 return;

@@ -101,7 +101,11 @@ static arch_eval_file_hooks: LazyLock<Vec<PythonArchEvalFileHook>> = LazyLock::n
     PythonArchEvalFileHook {odoo_entry: true,
                         trees: vec![
                             ((15, 3), (19, 2), (&["odoo", "http"], &["request"])),
-                            ((19, 2), (999, 0), (&["odoo", "http", "requestlib"], &["request"]))
+                            ((19, 2), (999, 0), (&["odoo", "http", "requestlib"], &["request"])),
+                            // Since the http package declares it (`request: Request` for the type checkers,
+                            // a LocalProxy at runtime), as the attributes assigned on `request` are injected
+                            // into each class it evaluates to
+                            ((19, 2), (999, 0), (&["odoo", "http"], &["request"]))
                         ],
                         if_exist_only: true,
                         func: |odoo: &mut SyncOdoo, _entry: EntryPointKey, file_symbol: SourceFileKey, symbol: SymbolKey| {

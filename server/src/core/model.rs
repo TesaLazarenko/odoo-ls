@@ -463,6 +463,9 @@ impl Model {
 /// Lazily browses the classes of a model, one model at a time: first the classes of the model and of all the models
 /// it inherits from with `_inherit`, then the classes of the models delegated with `_inherits`,
 /// whether `_inherits` is declared by the model, by a model it inherits from (ex: a mixin), or by an `_inherits` model itself.
+/// A class of a model, with the module it is declared in
+pub type ModelClassAndModule = (ClassKey, Option<ModuleKey>);
+
 pub struct ModelClassesWalker {
     inherit_queue: VecDeque<ModelKey>,
     inherits_queue: VecDeque<ModelKey>,
@@ -483,7 +486,7 @@ impl ModelClassesWalker {
     /// Returns the classes of the next model with their module, and whether this model is reached through `_inherits`
     /// (in which case only its fields are visible).
     /// Models reached with `_inherit` are always returned before the ones reached through `_inherits`.
-    pub fn next_model(&mut self, session: &SessionInfo, from_module: Option<ModuleKey>) -> Option<(Vec<(ClassKey, Option<ModuleKey>)>, bool)> {
+    pub fn next_model(&mut self, session: &SessionInfo, from_module: Option<ModuleKey>) -> Option<(Vec<ModelClassAndModule>, bool)> {
         let st = &session.sync_odoo.symbol_table;
         let model_mgr = &session.sync_odoo.model_mgr;
         // visited is checked on pop, so that a model reached with both `_inherit` and `_inherits` is kept in the `_inherit` part

@@ -62,6 +62,10 @@ fn simulate_file_change(
 /// 2. XML diagnostics refresh when languages are added/removed
 /// 3. New files can introduce languages and trigger diagnostic refresh
 pub fn test_language_validation(mut session: SessionInfo) {
+    // the translations of a field (`name@fr_FR`) exist from 18.2
+    if crate::common::skip_before(&session, (18, 2), "test_language_validation") {
+        return;
+    }
     let lang_xml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/addons/module_lang_test/data/res_lang.xml");
     let items_xml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -231,6 +235,10 @@ fn test_additional_languages_config() {
 /// Test that all language codes from res.lang.csv are recognized as valid.
 /// This ensures no false positives due to error in parsing the main source of language codes.
 pub fn test_no_false_positives_from_res_lang_csv(mut session: SessionInfo) {
+    // the translations of a field (`name@fr_FR`) exist from 18.2
+    if crate::common::skip_before(&session, (18, 2), "test_no_false_positives_from_res_lang_csv") {
+        return;
+    }
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/addons/module_lang_test/data/all_langs_test.xml")
         .sanitize();
@@ -260,6 +268,10 @@ pub fn test_no_false_positives_from_res_lang_csv(mut session: SessionInfo) {
 
 /// Test that changing additional_languages via config update clears/restores OLS05068 diagnostics.
 pub fn test_config_additional_languages_updates_diagnostics(mut session: SessionInfo) {
+    // the translations of a field (`name@fr_FR`) exist from 18.2
+    if crate::common::skip_before(&session, (18, 2), "test_config_additional_languages_updates_diagnostics") {
+        return;
+    }
     let items_xml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/addons/module_lang_test/data/lang_test_items.xml")
         .sanitize();

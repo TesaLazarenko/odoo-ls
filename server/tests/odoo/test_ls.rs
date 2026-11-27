@@ -44,7 +44,11 @@ fn reload(session: &mut SessionInfo, path: &str, text: String, version: i32) {
     Odoo::update_file_index(session, Path::new(path), "py", false, false);
 }
 
-pub fn test_imports_after_dependency_edit(mut session: SessionInfo) {
+/// On its own server: reloading files may delay the rebuild, which needs the channel of a full session.
+#[test]
+fn test_imports_after_dependency_edit() {
+    let (mut odoo, config) = crate::common::setup_server(true);
+    let mut session = crate::common::create_init_session(&mut odoo, config);
     let odoo_path = Path::new(&env::var("COMMUNITY_PATH").unwrap()).sanitize();
     let addons = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/addons");
     let module_a = session.sync_odoo.get_symbol(&odoo_path, (&["odoo", "addons", "module_indirect_a"], &[]), u32::MAX)[0];
@@ -61,7 +65,11 @@ pub fn test_imports_after_dependency_edit(mut session: SessionInfo) {
     assert_eq!(session.st().evaluations(models_var[0]).unwrap().len(), 1);
 }
 
-pub fn test_import_found_again_after_rename(mut session: SessionInfo) {
+/// On its own server: reloading files may delay the rebuild, which needs the channel of a full session.
+#[test]
+fn test_import_found_again_after_rename() {
+    let (mut odoo, config) = crate::common::setup_server(true);
+    let mut session = crate::common::create_init_session(&mut odoo, config);
     let addons = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/addons");
     let constants = addons.join("module_1/constants/data/constants.py").sanitize();
     let data_init = addons.join("module_1/constants/data/__init__.py").sanitize();
