@@ -1,5 +1,5 @@
 use std::{
-    collections::{VecDeque, hash_map}, path::Path,
+    collections::{VecDeque, hash_map}, path::Path, sync::atomic::{AtomicU64, Ordering},
 };
 
 use lsp_types::{Diagnostic, DiagnosticTag, Range, SymbolKind};
@@ -15,7 +15,7 @@ use crate::{
         evaluation::{Evaluation, EvaluationSymbolPtr},
         evaluation_context::{Context, ContextKey, ContextValue},
         file_mgr::{FileInfo, FileMgr, NoqaInfo},
-        model::{Model, ModelKey},
+        model::{Model, ModelClassesWalker, ModelKey},
         odoo::SyncOdoo,
         python_arch_eval_hooks::get_base_model_symbol,
         symbols::{
@@ -35,6 +35,10 @@ use crate::{
         },
     }, oyarn, threads::SessionInfo, tree::{OYarnExt, Tree}, utils::{HashMap, HashSet, PathSanitizer}, weak_collections::WeakSet,
 };
+
+mod pending_invalidations;
+pub(crate) use pending_invalidations::PendingInvalidations;
+
 #[derive(Debug)]
 pub enum CreateError {
     NothingOnDisk,
@@ -43,6 +47,69 @@ pub enum CreateError {
 
 impl From<NameTakenError> for CreateError {
     fn from(e: NameTakenError) -> Self { Self::Existing(e.0) }
+}
+
+/// State of a get_member_symbol search, shared by the classes it goes through
+#[derive(Default)]
+struct MemberSearch {
+    visited_classes: HashSet<ClassKey>,
+    /// ext symbols of the visited classes, grouped by class in the visit order: only used if
+    /// no declared member is found in the whole hierarchy
+    ext_symbols: Vec<Vec<SymbolKey>>,
+}
+
+/// Results of [`SymbolTable::get_member_symbol`], reused while the symbols can not change: the cache is only
+/// enabled during read-only work (validation of a python file, search of references, see [`MemberCache::start`])
+/// and is suspended during any ARCH or ARCH_EVAL build, and emptied when the classes of a model change or a symbol is unloaded.
+#[derive(Debug, Default)]
+pub struct MemberCache {
+    /// (target, from_module, flags) -> member name -> (result, diagnostics)
+    results: HashMap<(SymbolKey, Option<ModuleKey>, u8), HashMap<String, (Vec<SymbolKey>, Vec<Diagnostic>)>>,
+    /// Incremented each time the cache is emptied, so that a search during which symbols changed is not stored
+    generation: u64,
+}
+
+impl MemberCache {
+    /// Enables the cache if it is not already. Returns true if it was enabled by this call: [`MemberCache::end`] has then
+    /// to be called with this value once the read-only work is done.
+    pub fn start(session: &mut SessionInfo) -> bool {
+        if session.sync_odoo.member_cache.is_some() {
+            return false;
+        }
+        session.sync_odoo.member_cache = Some(MemberCache::default());
+        true
+    }
+
+    pub fn end(session: &mut SessionInfo, started: bool) {
+        if started {
+            session.sync_odoo.member_cache = None;
+        }
+    }
+
+    /// Disables the cache while symbols are built. Returns whether it was enabled, to give to [`MemberCache::resume`]
+    pub fn suspend(session: &mut SessionInfo) -> bool {
+        session.sync_odoo.member_cache.take().is_some()
+    }
+
+    /// Enables the cache again after [`MemberCache::suspend`], empty as symbols may have changed
+    pub fn resume(session: &mut SessionInfo, was_enabled: bool) {
+        if was_enabled {
+            session.sync_odoo.member_cache = Some(MemberCache { results: HashMap::default(), generation: Self::next_generation() });
+        }
+    }
+
+    /// Empties the cache, if enabled
+    pub fn clear(session: &mut SessionInfo) {
+        if let Some(cache) = &mut session.sync_odoo.member_cache {
+            cache.results.clear();
+            cache.generation = Self::next_generation();
+        }
+    }
+
+    fn next_generation() -> u64 {
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        GENERATION.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 impl SymbolTable {
@@ -696,6 +763,8 @@ impl SymbolTable {
 
     ///Given a path, create the appropriated symbol and attach it to the given parent
     pub fn create_from_path(session: &mut SessionInfo, path: &Path, parent: FileSystemSymbolParent, require_module: bool) -> Result<SymbolKey, CreateError> {
+        // a new member of `parent`
+        MemberCache::clear(session);
         if require_module {
             let FileSystemSymbolParent::Namespace(addons) = parent else {
                 return Err(CreateError::NothingOnDisk);
@@ -874,10 +943,14 @@ impl SymbolTable {
         } else {
             ContentSymbols::default()
         };
-        let ext_sym = self.get_ext_symbol(target, name);
-        if ext_sym.len() > 1 {
-            content.symbols.extend(ext_sym.into_iter().map(SymbolKey::from));
-            content.always_defined = true;
+        // ext symbols of a class are instance attributes, not names of its body: they are handled by get_member_symbol.
+        // Functions are not modules either: their ext symbols are attributes of the function object (see get_sub_symbol)
+        if matches!(target, SymbolKey::File(_) | SymbolKey::Module(_) | SymbolKey::PythonPackage(_)) {
+            let ext_sym = self.get_ext_symbol(target, name);
+            if !ext_sym.is_empty() {
+                content.symbols.extend(ext_sym.into_iter().map(SymbolKey::from));
+                content.always_defined = true;
+            }
         }
         content
     }
@@ -900,6 +973,12 @@ impl SymbolTable {
 
             if !content.symbols.is_empty() {
                 result.insert(name.clone(), content.symbols);
+            }
+        }
+        // only ext symbols injected into a file are names of its body (see get_content_symbol)
+        if matches!(target, SymbolKey::File(_)) {
+            for (name, ext_symbols) in self.get_all_ext_symbols(target, name_prefix) {
+                result.entry(name).or_default().extend(ext_symbols.into_iter().map(SymbolKey::from));
             }
         }
         result
@@ -997,69 +1076,43 @@ impl SymbolTable {
         self.dependents_as_mut(dependency)[level_i][step_i - level_i].insert(target);
     }
 
-    /**
-     * reset the step of the symbol to given step and status to pending.
-     * It will signal the change to all dependents
-     */
+    /// Invalidate `symbol` from `step`: it is reset to `step` and queued to be built again, and so are the
+    /// steps of its dependents that depend on it.
+    ///
+    /// As this function can delete symbols (ext_symbols), it should not be run inside any build.
+    /// That's why process_rebuild is calling defer_invalidations. Do the same if you have to use this method in a build scope to avoid cache misses
     pub fn invalidate(session: &mut SessionInfo, symbol: SourceFileKey, step: BuildSteps) {
-        if step == BuildSteps::VALIDATION {
-            SymbolTable::invalidate_sub_functions(session, symbol);
-        }
-        session.st_mut().reset_build_status(symbol.into(), step, BuildStatus::PENDING);
+        Self::request_reset(session, symbol, step);
+        Self::invalidate_dependents(session, symbol, step);
+    }
+
+    /// Invalidate the steps of the dependents of `symbol` (and of the files of `symbol` if it's a module or a
+    /// package) that depend on its steps from `step` (see [`Self::invalidate`]). Used alone for an unloaded
+    /// `symbol`, that does not have to be reset.
+    pub fn invalidate_dependents(session: &mut SessionInfo, symbol: SourceFileKey, step: BuildSteps) {
         let mut vec_to_invalidate = VecDeque::from([symbol]);
         while let Some(ref_to_inv) = vec_to_invalidate.pop_front() {
             let in_workspace = session.st().in_workspace(ref_to_inv.into());
-            if step == BuildSteps::ARCH && in_workspace {
-                let arch_dependents = &session.st().dependents(ref_to_inv)[BuildSteps::ARCH as usize];
+            // every level from `step` is not reached anymore: dependents have to rebuild the step that depends on it
+            for level in (step as usize)..=(BuildSteps::VALIDATION as usize) {
+                if !in_workspace {
+                    break;
+                }
+                let dependents = &session.st().dependents(ref_to_inv)[level];
                 let mut build_queue = vec![];
-                for (index, hashset) in arch_dependents.iter().enumerate() {
+                for (offset, hashset) in dependents.iter().enumerate() {
                     for sym in hashset.iter_valid(session.st()) {
                         if !session.st().is_symbol_in_parents(sym.into(), ref_to_inv.into()) {
-                            build_queue.push((index, sym));
+                            build_queue.push((BuildSteps::from((level + offset) as i32), sym));
                         }
                     }
                 }
-                for (index, sym) in build_queue {
-                    if index == BuildSteps::VALIDATION as usize {
-                        SymbolTable::invalidate_sub_functions(session, sym);
-                    }
-                    session.st_mut().reset_build_status(sym.into(), BuildSteps::from(index as i32), BuildStatus::PENDING);
-                    BuildScheduler::queue(session, sym);
+                for (dep_step, sym) in build_queue {
+                    Self::request_reset(session, sym, dep_step);
                 }
-            }
-            if [BuildSteps::ARCH, BuildSteps::ARCH_EVAL].contains(&step) && in_workspace {
-                let arch_eval_dependents = &session.st().dependents(ref_to_inv)[BuildSteps::ARCH_EVAL as usize];
-                let mut build_queue = vec![];
-                for (index, hashset) in arch_eval_dependents.iter().enumerate() {
-                    for sym in hashset.iter_valid(session.st()) {
-                        if !session.st().is_symbol_in_parents(sym.into(), ref_to_inv.into()) {
-                            build_queue.push((index, sym));
-                        }
-                    }
-                }
-                for (index, sym) in build_queue {
-                    if index + 1 == BuildSteps::ARCH_EVAL as usize {
-                        session.st_mut().reset_build_status(sym.into(), BuildSteps::ARCH_EVAL, BuildStatus::PENDING);
-                        BuildScheduler::queue(session, sym);
-                    } else if index + 1 == BuildSteps::VALIDATION as usize {
-                        SymbolTable::invalidate_sub_functions(session, sym);
-                        session.st_mut().reset_build_status(sym.into(), BuildSteps::VALIDATION, BuildStatus::PENDING);
-                        BuildScheduler::queue(session, sym);
-                    }
-                }
-                for (model, from_module) in session.st().iter_all_model_keys(session, ref_to_inv.into()) {
-                    Model::add_dependents_to_validation(session, model, from_module);
-                }
-            }
-            if [BuildSteps::ARCH, BuildSteps::ARCH_EVAL, BuildSteps::VALIDATION].contains(&step) && in_workspace {
-                let validation_dependents = &session.st().dependents(ref_to_inv)[BuildSteps::VALIDATION as usize];
-                for sym in validation_dependents.iter()
-                        .flat_map(|s| s.iter_valid(session.st()))
-                        .collect::<Vec<_>>() {
-                    if !session.st_mut().is_symbol_in_parents(sym.into(), ref_to_inv.into()) {
-                        SymbolTable::invalidate_sub_functions(session, sym);
-                        session.st_mut().reset_build_status(sym.into(), BuildSteps::VALIDATION, BuildStatus::PENDING);
-                        BuildScheduler::queue(session, sym);
+                if level == BuildSteps::ARCH_EVAL as usize {
+                    for (model, from_module) in session.st().iter_all_model_keys(session, ref_to_inv.into()) {
+                        Model::add_dependents_to_validation(session, model, from_module);
                     }
                 }
             }
@@ -1069,6 +1122,58 @@ impl SymbolTable {
                     vec_to_invalidate.push_back(sym);
                 }
             }
+        }
+    }
+
+    /// Reset `symbol` to `step`, or request it while something is being built (see [`Self::invalidate`])
+    fn request_reset(session: &mut SessionInfo, symbol: SourceFileKey, step: BuildSteps) {
+        if !session.sync_odoo.build_scheduler.pending_invalidations().are_deferred() {
+            Self::reset(session, symbol, step);
+            return;
+        }
+        let current_step = session.st().get_current_build_step(symbol.into());
+        // If `symbol` is being built, its build sets `current_step` DONE at its end anyway, overtaking the
+        // reset: only its sub functions, that are not built with it, are invalidated.
+        let overtaken = step <= current_step
+            && session.st().build_status(symbol.into(), current_step) == BuildStatus::IN_PROGRESS;
+        let pending = session.sync_odoo.build_scheduler.pending_invalidations();
+        if overtaken {
+            pending.request_sub_functions_invalidation(symbol);
+        } else {
+            pending.request_reset(symbol, step);
+        }
+    }
+
+    /// Reset `symbol` to `step` and queue it to be built again. Its sub functions are reset too, to be built
+    /// again before its validation, and the ext symbols it injected if its ARCH_EVAL is reset, as it injects
+    /// them again.
+    fn reset(session: &mut SessionInfo, symbol: SourceFileKey, step: BuildSteps) {
+        let already_queued = session.st().build_status(symbol.into(), step) == BuildStatus::PENDING
+            && BuildScheduler::is_queued(session, symbol);
+        let functions_reset = Self::invalidate_sub_functions(session, symbol);
+        if already_queued && !functions_reset {
+            // already waiting for `step` with the same functions to build: nothing to reset or queue again
+            return;
+        }
+        if step <= BuildSteps::ARCH_EVAL {
+            session.st_mut().remove_ext_symbols(symbol.into());
+        }
+        session.st_mut().reset_build_status(symbol.into(), step, BuildStatus::PENDING);
+        BuildScheduler::queue(session, symbol);
+    }
+
+    /// Apply the invalidations requested while something was being built (see [`Self::invalidate`]).
+    /// Must be called while nothing is being built: between two builds.
+    pub fn apply_pending_invalidations(session: &mut SessionInfo) {
+        for (symbol, step) in session.sync_odoo.build_scheduler.pending_invalidations().take_resets() {
+            if session.st().is_key_valid(symbol) {
+                Self::reset(session, symbol, step);
+            }
+        }
+        while let Some(file) = session.sync_odoo.build_scheduler.pending_invalidations()
+            .pop_sub_functions_invalidation(&session.sync_odoo.symbol_table)
+        {
+            Self::invalidate_sub_functions(session, file);
         }
     }
 
@@ -1087,16 +1192,33 @@ impl SymbolTable {
         }
     }
 
-    pub fn invalidate_sub_functions(session: &mut SessionInfo, target: SourceFileKey) {
-        if let Some(deferred) = &mut session.sync_odoo.deferred_subfunc_invalidation {
-            deferred.insert(target);
-            return;
+    /// Reset the functions of `target` back to ARCH_EVAL, clearing their evaluations. They are built
+    /// again by the function queues of the BuildScheduler once `target` is queued for its validation.
+    /// Applied right away (unless held, see `BuildScheduler::hold_sub_functions_invalidations`): it must
+    /// not be called while something is being built, see [`Self::invalidate`].
+    /// Returns true if a function has been reset now (and so may have to be queued again). Always false if
+    /// the invalidation is held.
+    pub fn invalidate_sub_functions(session: &mut SessionInfo, target: SourceFileKey) -> bool {
+        let pending = session.sync_odoo.build_scheduler.pending_invalidations();
+        if pending.are_sub_functions_held() {
+            pending.request_sub_functions_invalidation(target);
+            return false;
         }
+        let mut reset = false;
         for func_key in session.st().iter_inner_functions(target.into()) {
+            let func = &session.st()[func_key];
+            if func.evaluations.is_empty() && func.get_build_status(BuildSteps::ARCH_EVAL) == BuildStatus::PENDING {
+                continue; // already reset: its ext symbols are already removed
+            }
+            // the ext symbols injected by the function are created again by its ARCH_EVAL
+            session.st_mut().remove_ext_symbols(func_key.into());
             let func = &mut session.st_mut()[func_key];
             func.evaluations.clear();
             func.reset_build_status(BuildSteps::ARCH_EVAL, BuildStatus::PENDING);
+            reset = true;
         }
+        BuildScheduler::queue_functions(session, target);
+        reset
     }
 
     pub fn previous_step_done(&self, target: BuildableSymbolKey, step: BuildSteps) -> bool {
@@ -1666,6 +1788,11 @@ impl SymbolTable {
         let mut result: HashMap<OYarn, Vec<SymbolKey>> = HashMap::default();
         let mut acc = HashSet::default();
         Self::_all_members(symbol, session, &mut result, with_co_models, only_fields, only_methods, from_module, &mut acc, is_super);
+        // Every class implicitly inherits from object, but this base is not stored in the bases list
+        if !only_fields && matches!(symbol, SymbolKey::Class(_))
+            && let Some(object) = session.sync_odoo.get_ts_object().upgrade(session.st()) {
+            Self::_all_members(object, session, &mut result, false, only_fields, only_methods, from_module, &mut acc, false);
+        }
         result
     }
 
@@ -1706,36 +1833,27 @@ impl SymbolTable {
                     }
                 }
                 let model_option = session.st()[class_key]._model.as_ref().and_then(|model_data|
-                    session.model_mgr().get_model(&model_data.name)
+                    session.model_mgr().get_model_key(&model_data.name)
                 );
                 if let Some(model) = model_option && with_co_models {
-                    // no recursion because it is handled in all_symbols_inherits
-                    let (model_symbols, model_inherits_symbols) = model.all_symbols_inherits(session, from_module);
-                    for (model_class_key, dependency) in model_symbols {
-                        if dependency.is_some() || class_key == model_class_key {
-                            continue;
-                        }
-                        let model_sym = &session.st()[model_class_key];
-                        let all_symbols: Vec<_> = iter_symbol_keys(model_sym).copied().collect();
-                        for s in all_symbols {
-                            if (only_fields && !Self::is_field(session, s)) || (only_methods && !matches!(s, SymbolKey::Function(_))) {
+                    // no recursion because the walker browses the whole inheritance
+                    let mut walker = ModelClassesWalker::new(model);
+                    while let Some((model_classes, through_inherits)) = walker.next_model(session, from_module) {
+                        //only fields are visible on inherits, not methods
+                        let only_fields = only_fields || through_inherits;
+                        for (model_class_key, _) in model_classes {
+                            if class_key == model_class_key {
                                 continue;
                             }
-                            let name = session.st().name(s).clone();
-                            append_result(name, s);
-                        }
-                    }
-                    for (model_class_key, dependency) in model_inherits_symbols {
-                        if dependency.is_some() || class_key == model_class_key {
-                            continue;
-                        }
-                        let model_sym = &session.st()[model_class_key];
-                        // for inherits symbols, we only add fields
-                        let all_symbols: Vec<_> = iter_symbol_keys(model_sym).copied().collect();
-                        let fields = all_symbols.into_iter().filter(|&s| Self::is_field(session, s)).collect::<Vec<_>>();
-                        for s in fields {
-                            let name = session.st().name(s).clone();
-                            append_result(name, s);
+                            let model_sym = &session.st()[model_class_key];
+                            let all_symbols: Vec<_> = iter_symbol_keys(model_sym).copied().collect();
+                            for s in all_symbols {
+                                if (only_fields && !Self::is_field(session, s)) || (only_methods && !matches!(s, SymbolKey::Function(_))) {
+                                    continue;
+                                }
+                                let name = session.st().name(s).clone();
+                                append_result(name, s);
+                            }
                         }
                     }
                 }
@@ -1775,6 +1893,12 @@ impl SymbolTable {
                         append_result(name, s);
                     }
                 )
+            }
+        }
+        // Add Ext variables
+        if !only_fields && !only_methods && !(is_super && matches!(symbol_key, SymbolKey::Class(_))) {
+            for (name, ext_symbols) in session.st().get_all_ext_symbols(symbol_key, "") {
+                result.entry(name).or_default().extend(ext_symbols.into_iter().map(SymbolKey::from));
             }
         }
     }
@@ -2056,8 +2180,60 @@ impl SymbolTable {
         all: bool,
         is_super: bool
     ) -> (Vec<SymbolKey>, Vec<Diagnostic>) {
-        let mut visited_classes: HashSet<ClassKey> = HashSet::default();
-        Self::get_member_symbol_helper(session, target, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super, &mut visited_classes)
+        let flags = prevent_comodel as u8 | (only_fields as u8) << 1 | (only_methods as u8) << 2 | (all as u8) << 3 | (is_super as u8) << 4;
+        let cache_key = (target, from_module, flags);
+        let Some(cache) = session.sync_odoo.member_cache.as_ref() else {
+            return Self::get_member_symbol_uncached(session, target, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super);
+        };
+        if let Some(cached) = cache.results.get(&cache_key).and_then(|by_name| by_name.get(name)) {
+            return cached.clone();
+        }
+        let generation = cache.generation;
+        let result = Self::get_member_symbol_uncached(session, target, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super);
+        // not stored if symbols may have changed during the search (a build suspended or emptied the cache)
+        if let Some(cache) = &mut session.sync_odoo.member_cache
+            && cache.generation == generation {
+            cache.results.entry(cache_key).or_default().insert(name.to_string(), result.clone());
+        }
+        result
+    }
+
+    fn get_member_symbol_uncached(
+        session: &mut SessionInfo,
+        target: SymbolKey,
+        name: &str,
+        from_module: Option<ModuleKey>,
+        prevent_comodel: bool,
+        only_fields: bool,
+        only_methods: bool,
+        all: bool,
+        is_super: bool
+    ) -> (Vec<SymbolKey>, Vec<Diagnostic>) {
+        let mut search = MemberSearch::default();
+        let (mut result, diagnostics) = Self::get_member_symbol_helper(session, target, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super, &mut search);
+        // Every class implicitly inherits from object, but this base is not stored in the bases list
+        if result.is_empty() && !only_fields && matches!(target, SymbolKey::Class(_))
+            && let Some(object) = session.sync_odoo.get_ts_object().upgrade(session.st())
+            && object != target {
+            result = session.st().get_sub_symbol(object, name, u32::MAX).symbols;
+            if only_methods {
+                result.retain(|&x| Self::is_method(session, x));
+            }
+        }
+        // Add Ext symbols as results only as a fallback, if we found nothing else
+        if result.is_empty() {
+            'classes: for class_ext_symbols in search.ext_symbols {
+                for symbol in class_ext_symbols {
+                    if !result.contains(&symbol) {
+                        result.push(symbol);
+                        if !all {
+                            break 'classes;
+                        }
+                    }
+                }
+            }
+        }
+        (result, diagnostics)
     }
 
     fn get_member_symbol_helper(
@@ -2070,7 +2246,7 @@ impl SymbolTable {
         only_methods: bool,
         all: bool,
         is_super: bool,
-        visited_classes: &mut HashSet<ClassKey>
+        search: &mut MemberSearch,
     ) -> (Vec<SymbolKey>, Vec<Diagnostic>) {
         let mut result: Vec<SymbolKey> = vec![];
         let mut visited_symbols: HashSet<SymbolKey> = HashSet::default();
@@ -2157,34 +2333,16 @@ impl SymbolTable {
         if model_data.is_some() && !prevent_comodel {
             let model = session.model_mgr().get_model_key(&model_data.as_ref().unwrap().name);
             if let Some(model) = model {
-                // from_module: None means no dependency filtering (return everything)
-                let model_symbols = Model::get_full_model_classes(model, session, from_module);
-                for model_symbol in model_symbols {
-                    if target == model_symbol || visited_classes.contains(&model_symbol) {
-                        continue;
-                    }
-                    visited_classes.insert(model_symbol);
-                    let member_from_module = session.st().find_module(model_symbol);
-                    let (attributs, att_diagnostic) = Self::get_member_symbol_helper(session, model_symbol.into(), name, member_from_module, true, only_fields, only_methods, all, false, visited_classes);
-                    diagnostics.extend(att_diagnostic);
-                    if all {
-                        extend_result(attributs, &mut result, &mut visited_symbols);
-                    } else {
-                        if !attributs.is_empty() {
-                            return (attributs, diagnostics);
-                        }
-                    }
-                }
-                for model_inherits_symbol in session.model_mgr()[model].get_inherits_models(session, from_module) {
-                    //only fields are visible on inherits, not methods
-                    let model_symbols = Model::get_full_model_classes(model_inherits_symbol, session, from_module);
-                    for model_symbol in model_symbols {
-                        if target == model_symbol || visited_classes.contains(&model_symbol) {
+                let mut walker = ModelClassesWalker::new(model);
+                while let Some((model_symbols, through_inherits)) = walker.next_model(session, from_module) {
+                    for (model_symbol, member_from_module) in model_symbols {
+                        if target == model_symbol || search.visited_classes.contains(&model_symbol) {
                             continue;
                         }
-                        visited_classes.insert(model_symbol);
-                        let member_from_module = session.st().find_module(model_symbol);
-                        let (attributs, att_diagnostic) = Self::get_member_symbol_helper(session, model_symbol.into(), name, member_from_module, true, true, only_methods, all, false, visited_classes);
+                        search.visited_classes.insert(model_symbol);
+                        //only fields are visible on inherits, not methods
+                        let only_fields = only_fields || through_inherits;
+                        let (attributs, att_diagnostic) = Self::get_member_symbol_helper(session, model_symbol.into(), name, member_from_module, true, only_fields, only_methods, all, false, search);
                         diagnostics.extend(att_diagnostic);
                         if all {
                             extend_result(attributs, &mut result, &mut visited_symbols);
@@ -2201,11 +2359,13 @@ impl SymbolTable {
             let class_sym = &session.st()[c];
             let bases = class_sym.bases.iter().filter_map(|w| w.upgrade(session.st())).collect::<Vec<_>>();
             for base in bases {
-                if visited_classes.contains(&base){
+                if search.visited_classes.contains(&base){
                     continue;
                 }
-                visited_classes.insert(base);
-                let (s, s_diagnostic) = Self::get_member_symbol(session, base.into(), name, from_module, prevent_comodel, only_fields, only_methods, all, false);
+                search.visited_classes.insert(base);
+                let mut base_search = MemberSearch { visited_classes: HashSet::default(), ext_symbols: std::mem::take(&mut search.ext_symbols) };
+                let (s, s_diagnostic) = Self::get_member_symbol_helper(session, base.into(), name, from_module, prevent_comodel, only_fields, only_methods, all, false, &mut base_search);
+                search.ext_symbols = base_search.ext_symbols;
                     diagnostics.extend(s_diagnostic);
                 if !s.is_empty() {
                     if all {
@@ -2216,7 +2376,32 @@ impl SymbolTable {
                 }
             }
         }
+        // Only add ext symbols if result is empty, to not pollute "official" values
+        if !is_super && !only_fields && !only_methods && result.is_empty() {
+            let class_ext_symbols: Vec<SymbolKey> = session.st().get_ext_symbol(target, name).into_iter().map(SymbolKey::from).collect();
+            if !class_ext_symbols.is_empty() {
+                search.ext_symbols.push(class_ext_symbols);
+            }
+        }
         (result, diagnostics)
+    }
+
+    /// The symbols that `evaluations` evaluate to and that can host an attribute assigned from outside
+    /// (`base.x = ...`): classes (or class instances), namespaces, packages, files and functions
+    pub fn evaluated_ext_targets(session: &mut SessionInfo, evaluations: &[Evaluation]) -> Vec<SymbolKey> {
+        let mut targets = HashSet::default();
+        for evaluation in evaluations.iter() {
+            let symbol = evaluation.symbol.get_symbol(session, None, &mut vec![], None);
+            for followed in SymbolTable::follow_ref(&symbol, session, None, false, false, None, None) {
+                if let Some(target) = followed.upgrade_weak(session.st())
+                    && matches!(target, SymbolKey::Class(_) | SymbolKey::Namespace(_) | SymbolKey::PythonPackage(_)
+                        | SymbolKey::Module(_) | SymbolKey::File(_) | SymbolKey::Function(_))
+                    && !targets.contains(&target) {
+                        targets.insert(target);
+                    }
+            }
+        }
+        targets.into_iter().collect::<Vec<_>>()
     }
 
     /**

@@ -9,6 +9,7 @@ use crate::core::entry_point::EntryPointKey;
 use crate::core::evaluation_context::{ContextKey, ContextValue};
 use crate::core::file_mgr::FileInfoKey;
 use crate::core::file_mgr::Ast;
+use crate::core::symbols::symbol_table_impl::MemberCache;
 use crate::core::symbols::storage::SymbolTable;
 use crate::core::symbols::storage::xml::xml_field_symbol::XmlFieldName;
 use crate::core::symbols::symbol_keys::{ClassKey, ModelSymbolKey, ModuleKey, PythonBuildableSymbolKey, SourceFileKey, SymbolKey};
@@ -59,6 +60,13 @@ impl PythonValidator {
 
     /* Validate the symbol. The dependencies must be done before any validation. */
     pub fn validate(&mut self, session: &mut SessionInfo) {
+        // symbols do not change during the validation (except through builds, that suspend the cache)
+        let member_cache = MemberCache::start(session);
+        self.validate_impl(session);
+        MemberCache::end(session, member_cache);
+    }
+
+    fn validate_impl(&mut self, session: &mut SessionInfo) {
         let symbol = self.sym_stack[0];
         if !session.st().ready_for_step(symbol.unwrap_buildable_key(), BuildSteps::VALIDATION) {
             return;
@@ -188,6 +196,9 @@ impl PythonValidator {
                 Stmt::FunctionDef(f) => {
                     let sym = session.st().get_positioned_symbol(*self.sym_stack.last().unwrap(), &f.name, &f.range);
                     if let Some(sym) = sym {
+                        // Normally already done by the function queues of the BuildScheduler (see
+                        // `BuildScheduler::queue_functions`) - this is a safety net for functions that
+                        // were not queued (e.g. validating a single function directly).
                         if session.st().ready_for_step(sym.unwrap_buildable_key(), BuildSteps::ARCH) {
                             BuildScheduler::build_now(session, sym.unwrap_buildable_key(), BuildSteps::ARCH);
                         }
