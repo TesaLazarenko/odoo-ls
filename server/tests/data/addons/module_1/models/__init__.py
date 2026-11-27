@@ -8,3 +8,4 @@ from . import mixin_inherits_probe
 from . import models
 from . import reexport_usage
 from . import to_complete
+from . import xml_id_probe

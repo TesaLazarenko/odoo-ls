@@ -7,11 +7,12 @@ use crate::core::evaluation_context::{Context, ContextKey, ContextValue};
 use crate::core::evaluation_utils::DeepFieldEvalWalker;
 use crate::core::file_mgr::FileInfoKey;
 use crate::core::import_resolver;
+use crate::core::odoo::SyncOdoo;
 use crate::core::python_odoo_builder::ACCESS_OPERATOR_OPTIONS;
 use crate::core::symbols::storage::xml::xml_field_symbol::XmlFieldName;
 use crate::core::symbols::ModuleSymbol;
 use crate::core::symbols::symbol_keys::{
-    ClassKey, ModelSymbolKey, ModuleKey, SourceFileKey, SymbolKey,
+    ClassKey, FunctionKey, ModelSymbolKey, ModuleKey, SourceFileKey, SymbolKey,
 };
 use crate::core::symbols::storage::SymbolTable;
 use crate::features::ast_utils::AstUtils;
@@ -50,6 +51,7 @@ pub enum ExpectedType {
     RECORD_VALUES(ModelSymbolKey), // The field values of the model, like in `write({'name': 'x'})`
     RECORD_VALUES_LIST(ModelSymbolKey), // A list (or values directly for Backwards compatibility) of field values of the model for `create`
     MODEL_FIELD(ModelSymbolKey), // A field of the model, like the keys of the values given to `write({'name': 'x'})`
+    XML_ID(Option<OYarn>), // the model the record must have, e.g. res.groups for a groups list
 }
 
 pub struct CompletionFeature;
@@ -664,6 +666,9 @@ fn complete_call(session: &mut SessionInfo, file: SourceFileKey, expr_call: &ruf
             expr_call,
             arg_index,
         );
+        if let Some(xml_id_type) = xml_id_expected_type(session, callable, callable_sym, arg_index, keyword_name) {
+            return complete_expr(value, session, file, offset, is_param, &[xml_id_type]);
+        }
         let model = features_utils::model_called_on(session, callable);
         // If a callable has a special argument (e.g. the base method), use its expected type and ignore the others
         if let Some(special_expected_type) =
@@ -723,6 +728,45 @@ fn expected_type_of(
         SpecialArg::RecordValuesList => model.map(ExpectedType::RECORD_VALUES_LIST),
         SpecialArg::RecordValues => model.map(ExpectedType::RECORD_VALUES),
     }
+}
+
+/// Expected type of the argument `arg_index` (named `keyword_name` if given as a keyword) of a call
+/// to `callable_sym`, when that argument takes an xml_id.
+fn xml_id_expected_type(
+    session: &SessionInfo,
+    callable: &EvaluationSymbolWeak,
+    callable_sym: SymbolKey,
+    arg_index: usize,
+    keyword_name: Option<&str>,
+) -> Option<ExpectedType> {
+    match callable_sym {
+        SymbolKey::Function(func_key) => {
+            if let Some(name) = keyword_name {
+                return xml_id_param_type(session, func_key, name);
+            }
+            // `get_indexed_arg_in_call` gives up on overloads, as `env.ref` is since 19.0
+            let is_on_instance = callable.context.get(ContextKey::IsAttrOfInstance).map(|v| v.as_bool());
+            let param_index = arg_index + usize::from(is_on_instance.unwrap_or(false));
+            let param = session.st()[func_key].args.get(param_index)?.symbol.upgrade(session.st())?;
+            xml_id_param_type(session, func_key, &session.st()[param].name)
+        }
+        SymbolKey::Class(_) if keyword_name == Some("groups") && SymbolTable::is_field_class(session, callable_sym) =>
+            Some(ExpectedType::XML_ID(Some(Sy!("res.groups")))),
+        _ => None,
+    }
+}
+
+/// Expected type of the parameter `param` of `func_key`, when that parameter takes an xml_id.
+fn xml_id_param_type(session: &SessionInfo, func_key: FunctionKey, param: &str) -> Option<ExpectedType> {
+    let func = &session.st()[func_key];
+    if param == "xml_id" && func.evaluations.iter().any(|evaluation|
+        evaluation.symbol.get_symbol_hook.as_ref().is_some_and(|hook| hook.name == HookName::EvalEnvRef)) {
+        return Some(ExpectedType::XML_ID(None));
+    }
+    // `user_has_groups` is the BaseModel helper deprecated in 17.0, the others live on res.users
+    matches!((func.name.as_str(), param),
+        ("has_group", "group_ext_id") | ("has_groups", "group_spec") | ("user_has_groups", "groups"))
+        .then(|| ExpectedType::XML_ID(Some(Sy!("res.groups"))))
 }
 
 fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_string_literal: &ruff_python_ast::ExprStringLiteral, offset: usize, _is_param: bool, expected_type: &[ExpectedType]) -> Option<CompletionResponse> {
@@ -875,6 +919,53 @@ fn complete_string_literal(session: &mut SessionInfo, file: SourceFileKey, expr_
             ),
             &ExpectedType::MODEL_FIELD(model) => add_model_attributes(
                 session, &mut items, current_module, model.into(), false, true, false, expr_string_literal.value.to_str(), &None),
+            ExpectedType::XML_ID(model_filter) => {
+                // a `groups` value is a list, so only the segment being typed is completed
+                let prefix = expr_string_literal.value.to_str().rsplit(',').next().unwrap_or_default().trim_start().trim_start_matches('!');
+                // unfiltered ids number in the hundreds of thousands, so the module is named first
+                if model_filter.is_none() && !prefix.contains('.') {
+                    for (module_key, in_deps) in SyncOdoo::get_visible_modules(session, file, |module| !module.xml_ids.is_empty() && module.dir_name.starts_with(prefix)) {
+                        if !in_deps && !session.sync_odoo.config.ac_filter_model_names() {
+                            continue;
+                        }
+                        let dir_name = session.st()[module_key].dir_name.clone();
+                        let sort_prefix = if !in_deps { "~" } else if current_module == Some(module_key) { "_" } else { "" };
+                        items.push(CompletionItem {
+                            insert_text: Some(format!("{dir_name}.")),
+                            sort_text: Some(format!("{sort_prefix}{dir_name}")),
+                            kind: Some(lsp_types::CompletionItemKind::MODULE),
+                            label_details: (!in_deps).then(|| CompletionItemLabelDetails {
+                                detail: None,
+                                description: Some(format!("require {dir_name}")),
+                            }),
+                            label: dir_name.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+                let prefix_head = prefix.rfind('.').map_or("", |index| &prefix[..=index]);
+                for (module_key, local_id, in_deps) in SyncOdoo::get_xml_ids_by_prefix(session, file, prefix, model_filter.as_ref()) {
+                    if !in_deps && !session.sync_odoo.config.ac_filter_model_names() {
+                        continue;
+                    }
+                    let dir_name = session.st()[module_key].dir_name.clone();
+                    let label = format!("{}.{}", dir_name, local_id);
+                    // out of deps last, then the other modules, then the current one
+                    let sort_prefix = if !in_deps { "~" } else if current_module == Some(module_key) { "_" } else { "" };
+                    items.push(CompletionItem {
+                        insert_text: label.strip_prefix(prefix_head).map(str::to_string),
+                        sort_text: Some(format!("{sort_prefix}{label}")),
+                        kind: Some(lsp_types::CompletionItemKind::REFERENCE),
+                        label_details: (!in_deps).then(|| CompletionItemLabelDetails {
+                            detail: None,
+                            description: Some(format!("require {dir_name}")),
+                        }),
+                        label,
+                        ..Default::default()
+                    });
+                }
+            },
             ExpectedType::CLASS(_) => {},
             ExpectedType::INHERITS => {},
             ExpectedType::RECORD_VALUES(_) | ExpectedType::RECORD_VALUES_LIST(_) => {},
