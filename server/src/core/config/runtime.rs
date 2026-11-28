@@ -198,6 +198,22 @@ impl ConfigEntry {
             .map(str::to_string)
             .unwrap_or_else(default_python_command)
     }
+    /// The interpreter and its arguments: `python_command` split into words when set,
+    /// else `python_path` alone.
+    pub fn python_command(&self) -> Vec<String> {
+        match self.opt_str(ConfigKey::PythonCommand).map(crate::core::python_env::split_command) {
+            Some(words) if !words.is_empty() => words,
+            _ => vec![self.python_path()],
+        }
+    }
+    /// `path_mappings`, in declaration order.
+    pub fn path_mappings(&self) -> Vec<crate::core::python_env::PathMapping> {
+        self.values
+            .get(&ConfigKey::PathMappings)
+            .and_then(ConfigValue::as_list)
+            .map(|l| l.iter().filter_map(|s| crate::core::python_env::PathMapping::parse(s.value())).collect())
+            .unwrap_or_default()
+    }
     pub fn stdlib(&self) -> String {
         self.opt_str(ConfigKey::Stdlib).unwrap_or("").to_string()
     }

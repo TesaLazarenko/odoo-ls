@@ -153,6 +153,19 @@ impl CliBackend {
             ) {
                 config.set_str(ConfigKey::PythonPath, path);
             }
+
+        if let Some(python_command) = self.cli.python_command.clone() {
+            config.set_str(ConfigKey::PythonCommand, python_command);
+        }
+        if let Some(mappings) = self.cli.path_mapping.clone() {
+            config.extend_string_list(ConfigKey::PathMappings, mappings.into_iter().filter(|m| {
+                let valid = crate::core::python_env::PathMapping::parse(m).is_some();
+                if !valid {
+                    error!("Invalid path mapping '{m}', expected container_path=host_path");
+                }
+                valid
+            }));
+        }
     }
 
     fn setup(&self) -> Option<HashMap<String, String>> {
@@ -316,6 +329,8 @@ mod tests {
             community_path: None,
             tracked_folders: None,
             python: None,
+            python_command: None,
+            path_mapping: None,
             output: None,
             stubs: None,
             no_typeshed_stubs: false,

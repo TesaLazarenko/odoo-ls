@@ -20,6 +20,8 @@ pub enum ConfigKey {
     AddonsPaths,
     AddonsMerge,
     PythonPath,
+    PythonCommand,
+    PathMappings,
     Stdlib,
     AdditionalStubs,
     AdditionalStubsMerge,
@@ -77,6 +79,16 @@ pub(super) fn specs() -> Vec<FieldSpec> {
             .symlink_policy(SymlinkPolicy::PreserveLeaf)
             .stage(ResolvePaths, stages::canon_python_path)
             .stage(PostMergeProcessing, stages::default_python_path),
+        // The interpreter as a command line, for one that needs arguments, e.g.
+        // `docker exec -i odoo python3`. Takes precedence over `python_path`. It is run
+        // once per start; a container's environment is cached by image (see `python_env`).
+        FieldSpec::new(PythonCommand, "python_command", Str).triggers_restart(),
+        // `container_path=host_path` entries: where the directories of the interpreter's
+        // `sys.path` are on this machine (volumes). Unmapped container directories are
+        // copied once per image to the cache directory.
+        FieldSpec::new(PathMappings, "path_mappings", StrList)
+            .triggers_restart()
+            .stage(ResolvePaths, stages::canon_path_mappings),
         FieldSpec::new(Stdlib, "stdlib", Str)
             .default(ConfigValue::str(""))
             .triggers_restart()

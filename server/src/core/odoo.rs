@@ -39,11 +39,9 @@ use lsp_types::*;
 use request::{RegisterCapability, Request, WorkspaceConfiguration};
 use ruff_source_file::PositionEncoding;
 use ruff_text_size::TextRange;
-use serde_json::Value;
 use tracing::{error, warn, info};
 
 use crate::utils::HashSet;
-use std::process::Command;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::env;
@@ -416,60 +414,48 @@ impl SyncOdoo {
             for stub_dir in session.sync_odoo.stubs_dirs.clone().iter() {
                 EntryPointMgr::add_entry_to_public(session, stub_dir.clone());
             }
-            match Command::new(session.sync_odoo.config.python_path().clone()).args(["-c", "import sys; import json; print(json.dumps(sys.path))"]).output() {
+            let command = session.sync_odoo.config.python_command();
+            let mappings = session.sync_odoo.config.path_mappings();
+            let cache_root = crate::core::python_env::default_cache_root();
+            let probe_start = Instant::now();
+            let resolved = match crate::core::python_env::resolve(&command, &mappings, cache_root.as_deref()) {
+                Ok(resolved) => resolved,
                 Err(err) => {
-                    warn!("Wrong python command: {}, error: {}", session.sync_odoo.config.python_path().clone(), err);
+                    warn!("Wrong python command: {}, error: {}", command.join(" "), err);
+                    session.log_message(MessageType::WARNING, format!("Unable to use the Python interpreter '{}': {}", command.join(" "), err));
                     session.send_notification(OdooNotification::InvalidPythonPath, ());
                     break 'python_check;
-                },
-                Ok(output) => {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        session.log_message(MessageType::INFO, format!("Detected sys.path: {}", stdout));
-                        let paths: Vec<String> = serde_json::from_str(&stdout).expect("Unable to get paths with json of sys.path output");
-                        for path in paths.iter() {
-                            let path = path.replace("\\\\", "\\");
-                            let pathbuf = Path::new(&path);
-                            if pathbuf.is_dir() {
-                                let final_path = pathbuf.sanitize_cow();
-                                session.log_message(MessageType::INFO, format!("Adding sys.path: {}", final_path));
-                                EntryPointMgr::add_entry_to_public(session, final_path.to_string());
-                            }
-                        }
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("Error reading sys.path: {}", stderr);
-                    }
+                }
+            };
+            let summary = format!(
+                "Python environment of '{}' {} in {} ms",
+                command.join(" "),
+                if resolved.from_cache { "loaded from cache" } else { "detected" },
+                probe_start.elapsed().as_millis()
+            );
+            info!("{}", summary);
+            session.log_message(MessageType::INFO, summary);
+            for note in resolved.notes.iter() {
+                info!("{}", note);
+                session.log_message(MessageType::INFO, note.clone());
+            }
+            let env = resolved.env;
+            for path in env.sys_path.iter() {
+                let path = path.replace("\\\\", "\\");
+                let pathbuf = Path::new(&path);
+                if pathbuf.is_dir() {
+                    let final_path = pathbuf.sanitize_cow();
+                    session.log_message(MessageType::INFO, format!("Adding sys.path: {}", final_path));
+                    EntryPointMgr::add_entry_to_public(session, final_path.to_string());
                 }
             }
-            match Command::new(session.sync_odoo.config.python_path().clone()).args(["-c", "import sys, importlib.machinery, json; print(json.dumps({'version_info': list(sys.version_info)[:3], 'ext_suffixes': list(importlib.machinery.EXTENSION_SUFFIXES)}))"]).output() {
-                Err(err) => {
-                    warn!("Wrong python command: {}, error: {}", session.sync_odoo.config.python_path().clone(), err);
-                    session.send_notification(OdooNotification::InvalidPythonPath, ());
-                },
-                Ok(output) => {
-                    session.sync_odoo.has_valid_python = true;
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        session.log_message(MessageType::INFO, format!("Detected python info: {}", stdout));
-                        let info: Value = serde_json::from_str(&stdout).expect("Unable to parse python info json");
-                        session.sync_odoo.python_version = info["version_info"].as_array()
-                            .expect("Expected JSON array for version_info")
-                            .iter()
-                            .filter_map(|v| v.as_u64())
-                            .take(3)
-                            .collect();
-                        session.sync_odoo.python_ext_suffixes = info["ext_suffixes"].as_array()
-                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                            .unwrap_or_default();
-                        info!("Detected python version: {}.{}.{}", session.sync_odoo.python_version[0], session.sync_odoo.python_version[1], session.sync_odoo.python_version[2]);
-                        info!("Detected python EXTENSION_SUFFIXES: {:?}", session.sync_odoo.python_ext_suffixes);
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("Error reading python info: {}", stderr);
-                    }
-                }
+            session.sync_odoo.has_valid_python = true;
+            if env.version.len() >= 3 {
+                session.sync_odoo.python_version = env.version.iter().take(3).copied().collect();
             }
+            session.sync_odoo.python_ext_suffixes = env.ext_suffixes;
+            info!("Detected python version: {}.{}.{}", session.sync_odoo.python_version[0], session.sync_odoo.python_version[1], session.sync_odoo.python_version[2]);
+            info!("Detected python EXTENSION_SUFFIXES: {:?}", session.sync_odoo.python_ext_suffixes);
         }
         let tsserver_handle = if session.sync_odoo.config.is_javascript_disabled() {
             session.send_notification(OdooNotification::JsLsStatus, false);

@@ -27,6 +27,16 @@ pub struct Cli {
     #[arg(long)]
     pub python: Option<String>,
 
+    /// Python interpreter as a command line, for one that needs arguments, e.g. "docker exec -i odoo python3"
+    /// (parse mode required). Takes precedence over --python.
+    #[arg(long)]
+    pub python_command: Option<String>,
+
+    /// Where a directory of the interpreter's sys.path is on this machine, as container_path=host_path
+    /// (parse mode required). Can be repeated.
+    #[arg(long)]
+    pub path_mapping: Option<Vec<String>>,
+
     /// Output path. Default to "output.json"
     #[arg(short, long)]
     pub output: Option<String>,

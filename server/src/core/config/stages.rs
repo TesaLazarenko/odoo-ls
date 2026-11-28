@@ -192,6 +192,49 @@ pub(super) fn canon_stdlib(
     canonicalize_scalar(profile, key, ctx, |p: &str| Path::new(p).is_dir())
 }
 
+/// `path_mappings`: each `container_path=host_path` entry keeps its container part as
+/// is and resolves its host part like any path setting (templates, relative to the
+/// config file, must be a directory).
+pub(super) fn canon_path_mappings(
+    profile: &mut Profile,
+    key: ConfigKey,
+    ctx: &PipelineCtx,
+) -> Result<(), String> {
+    let Some(ConfigValue::List(items)) = profile.get(key) else {
+        return Ok(());
+    };
+    let items = items.clone();
+    let vars = var_map(profile);
+    let mut out = Vec::new();
+    for item in &items {
+        let Some(mapping) = crate::core::python_env::PathMapping::parse(item.value()) else {
+            profile.add_rejected(
+                key,
+                item.value().clone(),
+                item.sources().clone(),
+                S!("expected 'container_path=host_path'"),
+            );
+            continue;
+        };
+        let host = Sourced::with_sources(mapping.host, item.sources().clone());
+        match canonicalize_value(&host, ctx, |p: &str| Path::new(p).is_dir(), key.symlink_policy(), vars.clone()) {
+            Ok(canon) => out.push(Sourced::with_sources(
+                format!("{}={}", mapping.container, canon.value()),
+                item.sources().clone(),
+            )),
+            Err(err) => profile.add_rejected(
+                key,
+                item.value().clone(),
+                item.sources().clone(),
+                format!("could not be resolved: {err}"),
+            ),
+        }
+    }
+    let grouped: Vec<Sourced<String>> = group_sourced_iters(out).collect();
+    profile.values.insert(key, ConfigValue::List(grouped));
+    Ok(())
+}
+
 /// `python_path` may be a bare command (e.g. `python3`); keep it verbatim if so,
 /// otherwise resolve it as a path (the spec's `PreserveLeaf` policy keeps a venv
 /// symlink intact).

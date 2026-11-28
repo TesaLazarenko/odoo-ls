@@ -22,6 +22,7 @@ pub mod module_load_order;
 pub mod odoo;
 pub mod pre_parser;
 pub mod python_arch_builder;
+pub mod python_env;
 pub mod python_arch_builder_hooks;
 pub mod python_arch_eval;
 pub mod python_arch_eval_hooks;

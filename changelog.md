@@ -10,6 +10,9 @@
 - New setting `ast_cache_size` (MB, default 64, 0 = unbounded): RAM budget for the ASTs and source texts of files that are not open in the editor (and the texts of XML/CSV/JS files); least recently used ones are rebuilt from disk on demand.
 - Python files of Odoo / addons-path modules outside the workspace are no longer validated (their diagnostics were never published).
 - `OLS_MEMPROF=<file.csv>`: opt-in memory profiling.
+- Python interpreter in a Docker/Podman container, see `server/docs/python-env.md`. New settings `python_command` (the interpreter as a command line, e.g. `docker exec -i odoo python3`; takes precedence over `python_path`) and `path_mappings` (`container_path=host_path` for volumes); CLI `--python-command` and `--path-mapping`.
+  The container's `sys.path` directories are copied once per image to the user cache directory (with `tar` in the container: no bytecode, no `odoo` package, empty placeholders for compiled extensions). The environment is cached by image ID: later starts only run `docker inspect`, and the cache is used when the container is unavailable.
+- The interpreter is run once per start instead of twice (one probe for the version, `EXTENSION_SUFFIXES` and `sys.path`).
 
 ## [1.6.2] - 2026/11/04 - Fixes
 
