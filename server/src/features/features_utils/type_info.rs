@@ -135,7 +135,11 @@ fn get_class_type_info(
         let comodel_name = comodel_name.as_str();
         return TypeInfo::VALUE(format!("({comodel_name}) {}", session.st()[class_key].name));
     }
-    TypeInfo::VALUE(if eval_weak.is_super {format!("super[{}]", session.st()[class_key].name)} else {session.st()[class_key].name.to_string()})
+    TypeInfo::VALUE(if eval_weak.is_super {
+        format!("super[{}]", session.st()[class_key].name)
+    } else {
+        crate::core::generics::display_with_type_args(session, &session.st()[class_key].name, &eval_weak.context)
+    })
 }
 
 /// Return type information for EvaluationSymbolWeak

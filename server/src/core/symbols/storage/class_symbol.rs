@@ -20,6 +20,8 @@ pub struct ClassSymbol {
     pub is_external: bool,
     pub doc_string: Option<String>,
     pub bases: Vec<Wk<ClassKey>>,
+    /// Type parameters and type arguments given to the bases, for a generic class only.
+    pub generics: Option<Box<crate::core::generics::ClassGenerics>>,
     pub range: TextRange,
     pub body_range: TextRange,
     pub _model: Option<ModelData>,
@@ -48,6 +50,7 @@ impl ClassSymbol {
             sections: vec![],
             symbols: HashMap::default(),
             bases: vec![],
+            generics: None,
             _model: None,
             noqas: NoqaInfo::None,
             _is_field_class: RefCell::new(None),

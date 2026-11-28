@@ -1062,6 +1062,24 @@ impl SyncOdoo {
         }
     }
 
+    /// Like `ensure_func_evaluations`, also for a function of an external file (stubs): the
+    /// members of generic classes (`list.__getitem__`, `dict.get`...) are typed by their
+    /// annotations, which the file's build does not evaluate for methods.
+    pub fn ensure_generic_func_evaluations(session: &mut SessionInfo, function_key: FunctionKey) {
+        SyncOdoo::ensure_func_evaluations(session, function_key);
+        if !session.st()[function_key].evaluations.is_empty() {
+            return;
+        }
+        let Some(func_file) = session.st().get_file(function_key.into()) else {
+            return;
+        };
+        if session.st().is_external(func_file.into()) {
+            BuildScheduler::build_now(session, func_file, BuildSteps::ARCH_EVAL);
+            BuildScheduler::build_now(session, function_key, BuildSteps::ARCH);
+            BuildScheduler::build_now(session, function_key, BuildSteps::ARCH_EVAL);
+        }
+    }
+
     pub fn is_request_cancelled(&self) -> bool {
         if let Some(request_id) = self.current_request_id.as_ref() {
             return !self.running_request_ids.lock().unwrap().contains(request_id);

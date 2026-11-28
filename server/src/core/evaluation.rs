@@ -2,6 +2,7 @@ use crate::core::build_scheduler::BuildScheduler;
 use crate::core::diagnostics::{Diag, DiagnosticCode, create_diag};
 use crate::core::evaluation_context::{Context, ContextKey, ContextValue};
 use crate::core::evaluation_utils::DeepFieldEvalWalker;
+use crate::core::generics;
 use crate::core::odoo::SyncOdoo;
 use crate::core::python_odoo_builder::ACCESS_OPERATOR_OPTIONS;
 use crate::core::symbols::storage::xml::xml_field_symbol::XmlFieldName;
@@ -667,6 +668,127 @@ impl Evaluation {
         context: {}
         diagnostics: vec![]
      */
+    /// The type arguments of a subscript (`[A, B | C]` -> `[[A], [B, C]]`), as instances.
+    fn eval_type_args(session: &mut SessionInfo, slice: &Expr, parent: SymbolKey, max_infer: &TextSize, context: &mut Context, required_dependencies: &mut Vec<Vec<SourceFileKey>>, diagnostics: &mut Vec<Diag>) -> generics::TypeArgs {
+        let elements: Vec<&Expr> = match slice {
+            Expr::Tuple(tuple) => tuple.elts.iter().collect(),
+            other => vec![other],
+        };
+        elements.into_iter().map(|element| {
+            let (evals, diags) = Evaluation::eval_from_ast(session, element, parent, max_infer, true, required_dependencies);
+            diagnostics.extend(diags);
+            evals.iter().map(|eval| eval.symbol.get_symbol(session, Some(context), &mut vec![], Some(parent))).collect()
+        }).collect()
+    }
+
+    fn eval_special_form(session: &mut SessionInfo, form: generics::SpecialForm, mut args: generics::TypeArgs, for_annotation: bool, range: TextRange) -> Vec<Evaluation> {
+        use generics::SpecialForm;
+        let ptrs: Vec<EvaluationSymbolPtr> = match form {
+            SpecialForm::Optional => args.into_iter().next().unwrap_or_default().into_iter().chain([EvaluationSymbolPtr::NONE]).collect(),
+            SpecialForm::Union => generics::optional_union(session, args.into_iter().flatten().collect()),
+            SpecialForm::Unwrap => args.into_iter().next().unwrap_or_default(),
+            SpecialForm::Type => args.into_iter().next().unwrap_or_default().into_iter().map(|mut ptr| {
+                if ptr.has_weak() {
+                    ptr.get_mut_weak().instance = Some(false);
+                }
+                ptr
+            }).collect(),
+            SpecialForm::Alias(module, name) => {
+                let Some(&class) = session.sync_odoo.get_symbol("", (&[module], &[name]), u32::MAX).last() else {
+                    return vec![];
+                };
+                // `Tuple[X, ...]`: the ellipsis is not a type argument.
+                if name == "tuple" && args.len() == 2 && args[1].is_empty() {
+                    args.pop();
+                }
+                vec![generics::with_type_args(generics::weak(class, Some(for_annotation)), args)]
+            },
+            SpecialForm::Generic | SpecialForm::Protocol | SpecialForm::Opaque => vec![],
+        };
+        ptrs.iter().map(|ptr| {
+            let mut eval = match ptr {
+                EvaluationSymbolPtr::NONE => Evaluation::new_none(),
+                _ => Evaluation::eval_from_ptr(ptr),
+            };
+            eval.range = Some(range);
+            eval
+        }).collect()
+    }
+
+    /// The type arguments of an instance of generic class `class` built by `call`, bound from
+    /// the parameters of its `__init__` or `__new__`. `None` when the class is not generic or
+    /// nothing is bound.
+    fn infer_constructor_type_args(session: &mut SessionInfo, class: SymbolKey, call: &ruff_python_ast::ExprCall, parent: SymbolKey, max_infer: &TextSize, context: &mut Context, required_dependencies: &mut Vec<Vec<SourceFileKey>>) -> Option<generics::TypeArgs> {
+        let SymbolKey::Class(c) = class else { return None };
+        let params = session.st()[c].generics.as_ref().map(|g| g.params.clone()).filter(|p| !p.is_empty())?;
+        if call.arguments.args.is_empty() {
+            return None;
+        }
+        let mut positional = vec![];
+        for arg in call.arguments.args.iter() {
+            let (arg_evals, _) = Evaluation::eval_from_ast(session, arg, parent, max_infer, false, required_dependencies);
+            let mut types = vec![];
+            for arg_eval in arg_evals.iter() {
+                let ptr = arg_eval.symbol.get_symbol(session, Some(context), &mut vec![], Some(parent));
+                types.extend(SymbolTable::follow_ref(&ptr, session, None, false, false, None, None));
+            }
+            positional.push(types);
+        }
+        let mut bindings: generics::Bindings = vec![];
+        for constructor in ["__init__", "__new__"] {
+            let (members, _) = SymbolTable::get_member_symbol(session, class, constructor, None, true, false, false, false, false);
+            let Some(&SymbolKey::Function(member)) = members.first() else { continue };
+            // Only a constructor of a class whose type variables are these (not `object.__init__`).
+            let Some(owner) = generics::owner_class(session, member.into()) else { continue };
+            let owner_bindings_ok = owner == class || generics::may_bind(session, class, owner, false);
+            if !owner_bindings_ok {
+                continue;
+            }
+            for overload in generics::select_call_overloads(session, member, &call.arguments, true) {
+                for (var, values) in generics::infer_call_bindings(session, overload, &positional, true) {
+                    match bindings.iter_mut().find(|(v, _)| *v == var) {
+                        Some((_, existing)) => existing.extend(values.into_iter().filter(|v| !existing.contains(v)).collect::<Vec<_>>()),
+                        None => bindings.push((var, values)),
+                    }
+                }
+            }
+        }
+        let args: generics::TypeArgs = params.iter()
+            .map(|param| bindings.iter().find(|(v, _)| v == param).map(|(_, values)| values.clone()).unwrap_or_default())
+            .collect();
+        args.iter().any(|alternatives| !alternatives.is_empty()).then_some(args)
+    }
+
+    /// Whether `expr` can only be a type: `None` or a subscript like `list[int]`.
+    fn is_type_expr(expr: &Expr) -> bool {
+        matches!(expr, Expr::NoneLiteral(_) | Expr::Subscript(_))
+    }
+
+    /// `__getitem__` overloads matching the key: those taking a `slice` for `x[a:b]`, the others otherwise.
+    fn select_getitem_overloads(session: &SessionInfo, candidates: Vec<SymbolKey>, is_slice: bool) -> Vec<SymbolKey> {
+        let candidates: Vec<SymbolKey> = candidates.into_iter().flat_map(|candidate| match candidate {
+            SymbolKey::Function(f) if FunctionSymbol::is_func_overloaded(session.st(), f) => {
+                generics::overload_chain(session, f).into_iter().map(SymbolKey::from).collect()
+            },
+            other => vec![other],
+        }).collect();
+        if candidates.len() < 2 {
+            return candidates;
+        }
+        let takes_slice = |sym: &SymbolKey| {
+            let SymbolKey::Function(f) = sym else { return false };
+            session.st()[*f].args.iter().skip(1).take(1).any(|arg| {
+                arg.annotation.as_deref().is_some_and(|annotation| matches!(annotation, Expr::Name(n) if n.id.as_str() == "slice"))
+            })
+        };
+        let (slice, other): (Vec<SymbolKey>, Vec<SymbolKey>) = candidates.iter().copied().partition(takes_slice);
+        match (is_slice, slice.is_empty(), other.is_empty()) {
+            (true, false, _) => slice,
+            (false, _, false) => other,
+            _ => candidates,
+        }
+    }
+
     pub fn analyze_ast(session: &mut SessionInfo, ast: &ExprOrIdent, parent: SymbolKey, max_infer: &TextSize, context: &mut Context, for_annotation: bool, required_dependencies: &mut Vec<Vec<SourceFileKey>>) -> AnalyzeAstResult {
         let mut evals = vec![];
         let mut diagnostics = vec![];
@@ -986,11 +1108,19 @@ impl Evaluation {
                                     }*/
                                 }
                                 if !found_hook {
+                                    // `Box[Item]()`: an instance with the type arguments of the class.
+                                    let mut instance_context = Context::default();
+                                    if let Some(args) = generics::type_args(base_eval_ptr) {
+                                        instance_context.insert(ContextKey::TypeArgs, ContextValue::TypeArgs(args.clone()));
+                                    } else if let Some(args) = Evaluation::infer_constructor_type_args(session, base_sym, expr, parent, max_infer, context, required_dependencies) {
+                                        // `enumerate(items())`, `Box(Item())`: the type arguments from the constructor's arguments.
+                                        instance_context.insert(ContextKey::TypeArgs, ContextValue::TypeArgs(args));
+                                    }
                                     evals.push(Evaluation{
                                         symbol: EvaluationSymbol {
                                             sym: EvaluationSymbolPtr::WEAK(EvaluationSymbolWeak {
                                                 weak: base_sym_weak_eval.weak,
-                                                context: Context::default(),
+                                                context: instance_context,
                                                 instance: Some(true),
                                                 is_super: false,
                                             }),
@@ -1011,6 +1141,9 @@ impl Evaluation {
                         // Ensure return-type evaluations are available: resolves type annotations
                         // (ARCH_EVAL) and, if still empty, infers from body (VALIDATION).
                         SyncOdoo::ensure_func_evaluations(session, f);
+                        if generics::bindings(&base_sym_weak_eval.context).is_some() {
+                            SyncOdoo::ensure_generic_func_evaluations(session, f);
+                        }
 
 
                         if required_dependencies.len() >= 3 && in_class {
@@ -1044,17 +1177,63 @@ impl Evaluation {
                         context.insert(ContextKey::BaseIsSelf, ContextValue::BOOLEAN(base_is_self));
                         context.insert(ContextKey::Parameters, ContextValue::ARGUMENTS(expr.arguments.clone()));
                         context.insert(ContextKey::IsInValidation, ContextValue::BOOLEAN(is_in_validation));
-                        let evaluations = &session.st()[f].evaluations;
-                        for eval in evaluations.clone() {
-                            let eval_ptr = eval.symbol.get_symbol_weak_transformed(session, Some(context), &mut diagnostics, Some(session.st().get_file(parent).unwrap().into()));
-                            evals.push(Evaluation{
-                                symbol: EvaluationSymbol {
-                                    sym: eval_ptr,
-                                    get_symbol_hook: None,
-                                },
-                                value: None,
-                                range: Some(expr.range())
-                            });
+                        let call_bindings = generics::bindings(&base_sym_weak_eval.context).cloned().unwrap_or_default();
+                        let is_generic_call = !call_bindings.is_empty()
+                            || session.st()[f].evaluations.iter().any(|eval| generics::has_type_vars(session, eval.symbol.get_symbol_ptr()));
+                        // On a generic class (`dict[str, Item].get(...)`) or of a generic function, the overloads matching the call.
+                        let overloads = if is_generic_call && FunctionSymbol::is_func_overloaded(session.st(), f) {
+                            let on_object = base_sym_weak_eval.context.get(ContextKey::IsAttrOfInstance).is_some() && !session.st()[f].is_static;
+                            let selected = generics::select_call_overloads(session, f, &expr.arguments, on_object);
+                            for &overload in selected.iter() {
+                                SyncOdoo::ensure_generic_func_evaluations(session, overload);
+                            }
+                            selected
+                        } else {
+                            vec![f]
+                        };
+                        let on_object = base_sym_weak_eval.context.get(ContextKey::IsAttrOfInstance).is_some() && !session.st()[f].is_static;
+                        let mut call_results = vec![];
+                        for &overload in overloads.iter() {
+                            let mut results: Vec<EvaluationSymbolPtr> = vec![];
+                            for eval in session.st()[overload].evaluations.clone() {
+                                let eval_ptr = eval.symbol.get_symbol_weak_transformed(session, Some(context), &mut diagnostics, Some(session.st().get_file(parent).unwrap().into()));
+                                results.extend(generics::substitute(session, &eval_ptr, &call_bindings));
+                            }
+                            // A generic function (`def first(xs: Iterable[T]) -> T`): its type variables from the arguments.
+                            if results.iter().any(|result| generics::has_type_vars(session, result)) {
+                                let mut positional = vec![];
+                                for arg in expr.arguments.args.iter() {
+                                    let (arg_evals, _) = Evaluation::eval_from_ast(session, arg, parent, max_infer, false, required_dependencies);
+                                    let mut types = vec![];
+                                    for arg_eval in arg_evals.iter() {
+                                        let ptr = arg_eval.symbol.get_symbol(session, Some(context), &mut vec![], Some(parent));
+                                        types.extend(SymbolTable::follow_ref(&ptr, session, None, false, false, None, None));
+                                    }
+                                    positional.push(types);
+                                }
+                                let inferred = generics::infer_call_bindings(session, overload, &positional, on_object);
+                                if !inferred.is_empty() {
+                                    results = generics::substitute_all(session, &results, &inferred);
+                                    results.retain(|result| generics::type_var_of(session, result).is_none());
+                                }
+                            }
+                            call_results.extend(results);
+                        }
+                        for eval_ptr in call_results {
+                            {
+                                // A type variable left unbound says nothing about the result.
+                                if generics::type_var_of(session, &eval_ptr).is_some() {
+                                    continue;
+                                }
+                                evals.push(Evaluation{
+                                    symbol: EvaluationSymbol {
+                                        sym: eval_ptr,
+                                        get_symbol_hook: None,
+                                    },
+                                    value: None,
+                                    range: Some(expr.range())
+                                });
+                            }
                         }
                         // removing in reverse order is more efficient
                         context.remove(ContextKey::IsInValidation);
@@ -1100,6 +1279,7 @@ impl Evaluation {
                             diagnostics.extend(attributes_diagnostics);
                             if !attributes.is_empty() {
                                 let is_instance = ibase.get_weak().instance.unwrap_or(false);
+                                let receiver_args = generics::type_args(ibase).cloned();
                                 attributes.iter().for_each(|&attribute|{
                                     let instance = match attribute {
                                         SymbolKey::Class(_) => match for_annotation {
@@ -1119,6 +1299,14 @@ impl Evaluation {
                                         weak.context.insert(ContextKey::BaseAttr, ContextValue::SYMBOL(base_loc.into()));
                                         weak.context.insert(ContextKey::BaseIsSelf, ContextValue::BOOLEAN(base_is_self));
                                         weak.context.insert(ContextKey::IsAttrOfInstance, ContextValue::BOOLEAN(is_instance));
+                                        // The values of the type variables of the class the member is defined in.
+                                        if let Some(owner) = generics::owner_class(session, attribute)
+                                            && generics::may_bind(session, base_loc, owner, receiver_args.is_some()) {
+                                                let bindings = generics::bindings_for(session, base_loc, receiver_args.as_ref(), owner);
+                                                if !bindings.is_empty() {
+                                                    weak.context.insert(ContextKey::TypeBindings, ContextValue::TypeBindings(bindings));
+                                                }
+                                            }
                                     }
                                     evals.push(eval);
                                 });
@@ -1190,7 +1378,7 @@ impl Evaluation {
                     evals.push(Evaluation::new_unbound(name));
                 }
             },
-            ExprOrIdent::Expr(Expr::Subscript(sub)) => {
+            ExprOrIdent::Expr(Expr::Subscript(sub)) => 'subscript: {
                 let (eval_left, diags) = Evaluation::eval_from_ast(session, &sub.value, parent, max_infer, false, required_dependencies);
                 diagnostics.extend(diags);
                 // TODO handle multiple eval_left
@@ -1201,19 +1389,29 @@ impl Evaluation {
                 if base.is_expired_if_weak(session.st()) {
                     return AnalyzeAstResult::from_only_diagnostics(diagnostics);
                 }
+                // `Optional[X]`, `List[X]`, `type[X]`...
+                if let Some(left) = base.upgrade_weak(session.st())
+                    && let Some(form) = generics::special_form(session, generics::resolve_imports(session, left)) {
+                        let args = Evaluation::eval_type_args(session, &sub.slice, parent, max_infer, context, required_dependencies, &mut diagnostics);
+                        evals.extend(Evaluation::eval_special_form(session, form, args, for_annotation, sub.range()));
+                        break 'subscript;
+                    }
                 let bases = SymbolTable::follow_ref(base, session, None, false, false, None, None);
+                let mut type_args: Option<generics::TypeArgs> = None;
+                let first_item = evals.len();
                 let value = Evaluation::expr_to_str(session, &sub.slice, parent, max_infer, false, &mut diagnostics);
                 diagnostics.extend(value.1);
                 for base in bases.iter() {
                     match base {
                         EvaluationSymbolPtr::WEAK(base_sym_weak_eval) if base_sym_weak_eval.instance == Some(false) => {
                             if let Some(SymbolKey::Class(_)) = base.upgrade_weak(session.st()) {
-                                // This is a Generic type (Field[int], or List[int]), for now we just return the main type/Class (Field/List)
-                                // TODO: handle generic types
+                                // A parameterized class (`list[Item]`, `Field[int]`): the class with its type arguments.
+                                let args = type_args.get_or_insert_with(|| Evaluation::eval_type_args(session, &sub.slice, parent, max_infer, context, required_dependencies, &mut diagnostics)).clone();
                                 let mut new_base = base.clone();
                                 if for_annotation {
                                     new_base.get_mut_weak().instance = Some(true);
                                 }
+                                let new_base = generics::with_type_args(new_base, args);
                                 evals.push(Evaluation {
                                     symbol: EvaluationSymbol {
                                         sym: new_base,
@@ -1230,6 +1428,7 @@ impl Evaluation {
                     if !base.has_weak() {
                         continue;
                     }
+                    let base_args = generics::type_args(base).cloned();
                     let base = base.upgrade_weak(session.st()).unwrap();
                     let get_item_symbols = SymbolTable::get_member_symbol(
                         session,
@@ -1242,9 +1441,17 @@ impl Evaluation {
                         true,
                         false,
                     ).0;
+                    let get_item_symbols = Evaluation::select_getitem_overloads(session, get_item_symbols, matches!(*sub.slice, Expr::Slice(_)));
                     for get_item in get_item_symbols {
                         if let SymbolKey::Function(f) = get_item {
                             SyncOdoo::ensure_func_evaluations(session, f);
+                        }
+                        let item_bindings = generics::owner_class(session, get_item)
+                            .filter(|&owner| generics::may_bind(session, base, owner, base_args.is_some()))
+                            .map(|owner| generics::bindings_for(session, base, base_args.as_ref(), owner))
+                            .unwrap_or_default();
+                        if !item_bindings.is_empty() && let SymbolKey::Function(f) = get_item {
+                            SyncOdoo::ensure_generic_func_evaluations(session, f);
                         }
                         let Some(evaluations) = session.st().evaluations(get_item) else {
                             continue;
@@ -1274,6 +1481,18 @@ impl Evaluation {
                                 context.remove(ContextKey::IsInValidation);
                                 context.insert(ContextKey::Range, old_range.unwrap());
                             }
+                            if get_item_eval.symbol.get_symbol_hook.is_none() && get_item_eval.symbol.get_symbol_ptr().has_weak()
+                                && !matches!(get_item_eval.symbol.get_symbol_ptr(), EvaluationSymbolPtr::SELF(_)) {
+                                // The item type of a typed container (`list[Item]`, `dict[str, Item]`, `Sequence[Item]`...).
+                                // An unbound type variable says nothing about the item: it is left out.
+                                for item in generics::substitute(session, get_item_eval.symbol.get_symbol_ptr(), &item_bindings) {
+                                    if generics::type_var_of(session, &item).is_none() {
+                                        let mut item_eval = Evaluation::eval_from_ptr(&item);
+                                        item_eval.range = Some(sub.range());
+                                        evals.push(item_eval);
+                                    }
+                                }
+                            }
                             if let EvaluationSymbolPtr::SELF(_) = get_item_eval.symbol.get_symbol_ptr() {
                                 // Evaluate to the base itself
                                 // For example for models, since you get the same type of recordset when subscripted
@@ -1289,9 +1508,32 @@ impl Evaluation {
                         }
                     }
                 }
+                // Overloads (`__getitem__(int)`, implementation) may give the same item twice.
+                let mut unique: Vec<Evaluation> = vec![];
+                for eval in evals.drain(first_item..) {
+                    if !unique.iter().any(|u| u.symbol == eval.symbol) {
+                        unique.push(eval);
+                    }
+                }
+                evals.extend(unique);
             },
             ExprOrIdent::Expr(Expr::BinOp(operator)) => {
-                if is_in_validation || odoo.evaluation_search.is_some() {
+                if operator.op == ruff_python_ast::Operator::BitOr && (for_annotation || Evaluation::is_type_expr(&operator.left) || Evaluation::is_type_expr(&operator.right)) {
+                    // `A | B` in a type: either of them.
+                    let (left, diags) = Evaluation::eval_from_ast(session, &operator.left, parent, max_infer, for_annotation, required_dependencies);
+                    diagnostics.extend(diags);
+                    let (right, diags) = Evaluation::eval_from_ast(session, &operator.right, parent, max_infer, for_annotation, required_dependencies);
+                    diagnostics.extend(diags);
+                    let all_types = left.iter().chain(right.iter()).all(|eval| match eval.symbol.get_symbol_ptr() {
+                        EvaluationSymbolPtr::NONE => true,
+                        ptr => ptr.has_weak() && (for_annotation || ptr.get_weak().instance == Some(false)),
+                    });
+                    if all_types {
+                        let alternatives: Vec<EvaluationSymbolPtr> = left.iter().chain(right.iter()).map(|eval| eval.symbol.get_symbol_ptr().clone()).collect();
+                        let kept = generics::optional_union(session, alternatives);
+                        evals.extend(left.into_iter().chain(right).filter(|eval| kept.contains(eval.symbol.get_symbol_ptr())).map(|mut eval| { eval.range = Some(operator.range()); eval }));
+                    }
+                } else if is_in_validation || odoo.evaluation_search.is_some() {
                     let (_, diags) = Evaluation::eval_from_ast(session, &operator.left, parent, max_infer, false, required_dependencies);
                     diagnostics.extend(diags);
                     let (_, diags) = Evaluation::eval_from_ast(session, &operator.right, parent, max_infer, false, required_dependencies);

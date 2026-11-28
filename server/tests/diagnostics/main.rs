@@ -44,6 +44,7 @@ use crate::{
     magic_fields_comodel::test_magic_fields_comodel,
     ols01000::test_ols01000,
     ols01001::test_ols01001,
+    ols01001::test_ols01001_subscripted_base,
     ols01002::test_ols01002,
     ols01003::test_ols01003,
     ols01004::test_ols01004,
@@ -103,6 +104,7 @@ fn test_diagnostics_no_odoo() {
     build_once_run_isolated(odoo, config, &[
         &test_ols01000,
         &test_ols01001,
+        &test_ols01001_subscripted_base,
         &test_ols01002,
         &test_ols01003,
         &test_ols01004,

@@ -13,6 +13,8 @@
 - Python interpreter in a Docker/Podman container, see `server/docs/python-env.md`. New settings `python_command` (the interpreter as a command line, e.g. `docker exec -i odoo python3`; takes precedence over `python_path`) and `path_mappings` (`container_path=host_path` for volumes); CLI `--python-command` and `--path-mapping`.
   The container's `sys.path` directories are copied once per image to the user cache directory (with `tar` in the container: no bytecode, no `odoo` package, empty placeholders for compiled extensions). The environment is cached by image ID: later starts only run `docker inspect`, and the cache is used when the container is unavailable.
 - The interpreter is run once per start instead of twice (one probe for the version, `EXTENSION_SUFFIXES` and `sys.path`).
+- Generic types, see `server/docs/generics.md`: type arguments are kept (`list[Item]`, `dict[str, Item]`) and substituted in methods, indexing (`x[0]`, `d["k"]`, `.get()`), `for` loops (also `for k, v in d.items()`, `enumerate`) and inherited bases (`class C(Box[Item])`); `Optional[X]`, `X | None`, `type[X]`, typing aliases (`List`, `Dict`...); generic functions and constructors bind their type variables from the arguments; PEP 695 (`class C[T]`, `def f[T]`). Hover shows the type arguments.
+- No more false OLS01001 `//Unhandled// not found` on `Generic[...]`, `Protocol[...]` and `List[...]` bases; an unresolved base is reported with its expression (`Unknown[int]`, `a.b`).
 
 ## [1.6.2] - 2026/11/04 - Fixes
 

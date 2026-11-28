@@ -62,7 +62,20 @@ impl AstUtils {
                 n.id.to_string()
             },
             Expr::Attribute(a) => {
-                AstUtils::flatten_expr(&a.value) + &a.attr
+                AstUtils::flatten_expr(&a.value) + "." + &a.attr
+            },
+            Expr::Subscript(s) => {
+                let slice = match s.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().map(AstUtils::flatten_expr).collect::<Vec<_>>().join(", "),
+                    other => AstUtils::flatten_expr(other),
+                };
+                format!("{}[{}]", AstUtils::flatten_expr(&s.value), slice)
+            },
+            Expr::Call(c) => AstUtils::flatten_expr(&c.func) + "()",
+            Expr::NoneLiteral(_) => S!("None"),
+            Expr::EllipsisLiteral(_) => S!("..."),
+            Expr::BinOp(b) if b.op == ruff_python_ast::Operator::BitOr => {
+                format!("{} | {}", AstUtils::flatten_expr(&b.left), AstUtils::flatten_expr(&b.right))
             },
             _ => {S!("//Unhandled//")}
         }

@@ -21,6 +21,8 @@ pub struct VariableSymbol {
     pub doc_string: Option<String>,
     pub is_import_variable: bool,
     pub is_parameter: bool,
+    /// A PEP 695 type parameter (`class C[T]`, `def f[T]`): a type variable.
+    pub is_type_param: bool,
     pub evaluations: Vec<Evaluation>, //Vec, because sometimes a single allocation can be ambiguous, like ''' a = "5" if X else 5 '''
     pub range: TextRange,
     /// What this name resolved to before a type-narrowing re-declaration shadowed it, so that
@@ -44,6 +46,7 @@ impl VariableSymbol {
             range,
             is_import_variable: false,
             is_parameter: false,
+            is_type_param: false,
             evaluations: vec![],
             narrowed_from: vec![],
             narrowing_check_range: None,

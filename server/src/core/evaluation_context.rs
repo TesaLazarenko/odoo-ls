@@ -4,6 +4,7 @@ use ruff_python_ast::Arguments;
 use ruff_text_size::TextRange;
 use thin_vec::ThinVec;
 
+use crate::core::evaluation::EvaluationSymbolPtr;
 use crate::core::symbols::symbol_keys::{ModuleKey, SymbolKey, Wk};
 
 
@@ -60,6 +61,10 @@ pub enum ContextKey {
     SearchArgRange,
     Selection,
     SelectionArgRange,
+    /// Type arguments of a parameterized type (`list[Item]` -> `[[Item]]`), see `generics`.
+    TypeArgs,
+    /// Values of the type variables of the class a member was found on, see `generics`.
+    TypeBindings,
     // placeholder after removal (tombstone) - should not be used as key
     EMPTY,
 }
@@ -95,7 +100,9 @@ impl ContextKey {
             | ContextKey::Related
             | ContextKey::Required
             | ContextKey::Search
-            | ContextKey::Selection => true,
+            | ContextKey::Selection
+            | ContextKey::TypeArgs
+            | ContextKey::TypeBindings => true,
             ContextKey::Range
             | ContextKey::ComodelNameArgRange
             | ContextKey::RelatedArgRange
@@ -121,6 +128,10 @@ pub enum ContextValue {
     SYMBOL(Wk<SymbolKey>),
     ARGUMENTS(Arguments),
     RANGE(TextRange),
+    /// One list of possible types per type argument (`list[A | B]` -> `[[A, B]]`).
+    TypeArgs(Vec<Vec<EvaluationSymbolPtr>>),
+    /// Type variable -> its possible types.
+    TypeBindings(Vec<(Wk<SymbolKey>, Vec<EvaluationSymbolPtr>)>),
     // empty value after removal - should not be used as value
     EMPTY,
 }
@@ -135,6 +146,9 @@ impl Hash for ContextValue {
             ContextValue::RANGE(r) => r.hash(state),
             // Hash by range, as the type does not implement Hash.
             ContextValue::ARGUMENTS(a) => a.range.hash(state),
+            // Equal values have the same shape: hashing it is enough for a valid Hash.
+            ContextValue::TypeArgs(args) => args.iter().map(Vec::len).for_each(|l| l.hash(state)),
+            ContextValue::TypeBindings(bindings) => bindings.iter().for_each(|(var, types)| { var.hash(state); types.len().hash(state) }),
             ContextValue::EMPTY => 0.hash(state),
         }
     }

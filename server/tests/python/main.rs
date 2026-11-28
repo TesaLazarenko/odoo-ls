@@ -9,6 +9,7 @@ mod test_cached_property;
 mod test_completion_trigger_kind;
 mod test_delete_dir_while_open;
 mod test_follow_ref;
+mod test_generics;
 mod test_standalone_file_lifecycle;
 mod test_type_hints;
 mod test_unicode;
@@ -59,6 +60,19 @@ fn test_expressions() {
         &test_function_return_type_hint,
         &test_with_statement_type_from_enter,
         &test_unpack,
+    ]);
+}
+
+#[test]
+fn test_generics() {
+    let (odoo, config) = setup_server(false);
+    build_once_run_isolated(odoo, config, &[
+        &test_generics::test_generic_types_resolve,
+        &test_generics::test_optional_and_union,
+        &test_generics::test_type_of_type_variable,
+        &test_generics::test_hover_shows_type_arguments,
+        &test_generics::test_unbound_type_variable_is_not_guessed,
+        &test_generics::test_generic_bases_have_no_diagnostics,
     ]);
 }
 

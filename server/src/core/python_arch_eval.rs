@@ -11,7 +11,8 @@ use crate::core::entry_point::{EntryPointKey, EntryPointType};
 use crate::core::symbols::symbol_table_impl::MemberCache;
 use crate::core::symbols::{ModuleSymbol, SymbolMgr};
 use crate::core::symbols::storage::SymbolTable;
-use crate::core::symbols::symbol_keys::{BuildableSymbolKey, ClassKey, FunctionKey, ModuleKey, PythonBuildableSymbolKey, SourceFileKey, SymbolKey, VariableKey};
+use crate::core::symbols::symbol_keys::{BuildableSymbolKey, ClassKey, FunctionKey, ModuleKey, PythonBuildableSymbolKey, SourceFileKey, SymbolKey, VariableKey, Wk};
+use crate::core::generics;
 use crate::{constants::*, oyarn};
 use crate::core::import_resolver::resolve_import_stmt;
 use crate::core::odoo::SyncOdoo;
@@ -671,11 +672,175 @@ impl PythonArchEval {
         self.handle_assigns(session, assigns, &named_expr.range);
     }
 
+    /// The type variables of a `Generic[...]` or `Protocol[...]` base, `None` for another base.
+    fn declared_type_params(&mut self, session: &mut SessionInfo, base: &Expr, position: TextSize) -> Option<Vec<Wk<SymbolKey>>> {
+        let Expr::Subscript(sub) = base else { return None };
+        let mut deps = vec![vec![], vec![]];
+        let (left, _) = Evaluation::eval_from_ast(session, &sub.value, *self.sym_stack.last().unwrap(), &position, false, &mut deps);
+        session.st_mut().insert_dependencies(self.file, &deps, BuildSteps::ARCH_EVAL);
+        let [left] = left.as_slice() else { return None };
+        let left = left.symbol.get_symbol_ptr().upgrade_weak(session.st())?;
+        let form = generics::special_form(session, generics::resolve_imports(session, left))?;
+        if !matches!(form, generics::SpecialForm::Generic | generics::SpecialForm::Protocol) {
+            return None;
+        }
+        let elements: Vec<&Expr> = match sub.slice.as_ref() {
+            Expr::Tuple(tuple) => tuple.elts.iter().collect(),
+            other => vec![other],
+        };
+        let mut params = vec![];
+        for element in elements {
+            let mut deps = vec![vec![], vec![]];
+            let (evals, _) = Evaluation::eval_from_ast(session, element, *self.sym_stack.last().unwrap(), &position, true, &mut deps);
+            session.st_mut().insert_dependencies(self.file, &deps, BuildSteps::ARCH_EVAL);
+            params.extend(evals.iter().filter_map(|eval| generics::type_var_of(session, eval.symbol.get_symbol_ptr())));
+        }
+        Some(params)
+    }
+
+    /// The type variables in these type arguments, in order of first appearance.
+    fn collect_type_vars(session: &SessionInfo, args: &generics::TypeArgs, out: &mut Vec<Wk<SymbolKey>>) {
+        for ptr in args.iter().flatten() {
+            if let Some(var) = generics::type_var_of(session, ptr) {
+                if !out.contains(&var) {
+                    out.push(var);
+                }
+            } else if let Some(nested) = generics::type_args(ptr) {
+                Self::collect_type_vars(session, nested, out);
+            }
+        }
+    }
+
+    /// The items of an iteration whose `__iter__` returns `eval_iter`: what the `__next__` of
+    /// that iterator returns, substituted. `None` when `__iter__` is a hook or returns `Self`
+    /// (recordsets), or the iterator has no typed `__next__`.
+    fn iteration_items(session: &mut SessionInfo, eval_iter: &Evaluation, iter_bindings: &generics::Bindings, iterable: &EvaluationSymbolPtr) -> Option<Vec<Evaluation>> {
+        if eval_iter.symbol.get_symbol_hook.is_some() {
+            return None;
+        }
+        let iterator = match eval_iter.symbol.get_symbol_ptr() {
+            // `def __iter__(self) -> Self` (`enumerate`, `zip`...): the iterable is its own iterator.
+            EvaluationSymbolPtr::SELF(_) if generics::type_args(iterable).is_some() => iterable.clone(),
+            EvaluationSymbolPtr::WEAK(_) => {
+                let [iterator] = generics::substitute(session, eval_iter.symbol.get_symbol_ptr(), iter_bindings).try_into().ok()?;
+                iterator
+            }
+            _ => return None,
+        };
+        let iterator_class = iterator.upgrade_weak(session.st()).filter(|class| matches!(class, SymbolKey::Class(_)))?;
+        let (nexts, _) = SymbolTable::get_member_symbol(session, iterator_class, "__next__", None, true, false, false, false, false);
+        let [SymbolKey::Function(next)] = nexts.as_slice() else { return None };
+        let next = *next;
+        let next_bindings = generics::owner_class(session, next.into())
+            .map(|owner| generics::bindings_for(session, iterator_class, generics::type_args(&iterator), owner))
+            .unwrap_or_default();
+        if next_bindings.is_empty() {
+            SyncOdoo::ensure_func_evaluations(session, next);
+        } else {
+            SyncOdoo::ensure_generic_func_evaluations(session, next);
+        }
+        let items: Vec<Evaluation> = session.st()[next].evaluations.clone().iter()
+            .flat_map(|eval| generics::substitute(session, eval.symbol.get_symbol_ptr(), &next_bindings))
+            .filter(|item| item.has_weak() && generics::type_var_of(session, item).is_none())
+            .map(|item| Evaluation::eval_from_ptr(&item))
+            .collect();
+        (!items.is_empty()).then_some(items)
+    }
+
+    /// The items of iterating `iter_expr`, when its type is generic (`list[Item]`,
+    /// `dict[str, Item].items()`...): see `iteration_items`.
+    fn generic_iteration_items(&mut self, session: &mut SessionInfo, iter_expr: &Expr, position: &TextSize, deps: &mut Vec<Vec<SourceFileKey>>) -> Option<Vec<Evaluation>> {
+        let (evals, _) = Evaluation::eval_from_ast(session, iter_expr, *self.sym_stack.last().unwrap(), position, false, deps);
+        session.st_mut().insert_dependencies(self.file, deps, self.current_step);
+        let [eval] = evals.as_slice() else { return None };
+        let ptr = eval.symbol.get_symbol(session, None, &mut vec![], None);
+        let resolved = SymbolTable::follow_ref(&ptr, session, None, false, false, None, None);
+        let [resolved] = resolved.as_slice() else { return None };
+        let class = resolved.upgrade_weak(session.st()).filter(|class| matches!(class, SymbolKey::Class(_)))?;
+        let args = generics::type_args(resolved).cloned();
+        let (iters, _) = SymbolTable::get_member_symbol(session, class, "__iter__", None, true, false, false, false, false);
+        let [SymbolKey::Function(iter)] = iters.as_slice() else { return None };
+        let iter = *iter;
+        let bindings = generics::owner_class(session, iter.into())
+            .filter(|&owner| generics::may_bind(session, class, owner, args.is_some()))
+            .map(|owner| generics::bindings_for(session, class, args.as_ref(), owner))
+            .unwrap_or_default();
+        if bindings.is_empty() {
+            return None;
+        }
+        SyncOdoo::ensure_generic_func_evaluations(session, iter);
+        let [eval_iter] = session.st()[iter].evaluations.clone().try_into().ok()?;
+        Self::iteration_items(session, &eval_iter, &bindings, resolved)
+    }
+
+    /// Element `index` of `item` when it is a tuple of `len` typed elements (`tuple[int, Item]`),
+    /// or of any length with one type (`tuple[Item, ...]`).
+    fn tuple_element(session: &mut SessionInfo, item: &Evaluation, index: usize, len: usize) -> Vec<Evaluation> {
+        let ptr = item.symbol.get_symbol_ptr();
+        let Some(args) = generics::type_args(ptr) else { return vec![] };
+        let tuple = session.sync_odoo.get_ts_tuple();
+        if ptr.upgrade_weak(session.st()) != tuple.upgrade(session.st()) {
+            return vec![];
+        }
+        let ellipsis = session.sync_odoo.get_ts_ellipsis();
+        let is_ellipsis = |alternatives: &Vec<EvaluationSymbolPtr>| alternatives.iter().all(|a| a.upgrade_weak(session.st()) == ellipsis.upgrade(session.st()));
+        let element = if args.len() == len {
+            &args[index]
+        } else if args.len() == 2 && is_ellipsis(&args[1]) {
+            &args[0]
+        } else {
+            return vec![];
+        };
+        element.iter()
+            .filter(|ptr| ptr.has_weak() && generics::type_var_of(session, ptr).is_none())
+            .map(Evaluation::eval_from_ptr)
+            .collect()
+    }
+
+    /// The PEP 695 type parameters of a class or function, and the position after them.
+    fn pep695_type_params(session: &SessionInfo, scope: SymbolKey, type_params: Option<&ruff_python_ast::TypeParams>) -> Option<(Vec<Wk<SymbolKey>>, TextSize)> {
+        let type_params = type_params?;
+        let params = type_params.type_params.iter().filter_map(|type_param| {
+            let (name, range) = match type_param {
+                ruff_python_ast::TypeParam::TypeVar(t) => (&t.name, t.range),
+                ruff_python_ast::TypeParam::ParamSpec(p) => (&p.name, p.range),
+                ruff_python_ast::TypeParam::TypeVarTuple(t) => (&t.name, t.range),
+            };
+            session.st().get_positioned_symbol(scope, name.as_str(), &range).map(Wk::from)
+        }).collect();
+        Some((params, type_params.range.end()))
+    }
+
+    /// Whether `__iter__` returns another object than itself, an iterator with a `__next__`.
+    fn returns_iterator(session: &mut SessionInfo, eval_iter: &Evaluation) -> bool {
+        if eval_iter.symbol.get_symbol_hook.is_some() || !matches!(eval_iter.symbol.get_symbol_ptr(), EvaluationSymbolPtr::WEAK(_)) {
+            return false;
+        }
+        let Some(class) = eval_iter.symbol.get_symbol_ptr().upgrade_weak(session.st()).filter(|c| matches!(c, SymbolKey::Class(_))) else {
+            return false;
+        };
+        !SymbolTable::get_member_symbol(session, class, "__next__", None, true, false, false, false, false).0.is_empty()
+    }
+
     fn load_base_classes(&mut self, session: &mut SessionInfo, loc_sym: ClassKey, class_stmt: &StmtClassDef) {
         session.st_mut()[loc_sym].bases.clear();
+        session.st_mut()[loc_sym].generics = None;
+        // `class C[T](Base[T])`: the bases see the type parameters, declared in the class.
+        let pep695 = Self::pep695_type_params(session, loc_sym.into(), class_stmt.type_params.as_deref());
+        if pep695.is_some() {
+            self.sym_stack.push(loc_sym.into());
+        }
+        let base_position = pep695.as_ref().map(|(_, end)| *end).unwrap_or(class_stmt.range().start());
+        let mut declared_params: Option<Vec<Wk<SymbolKey>>> = pep695.as_ref().map(|(params, _)| params.clone());
+        let mut base_args: Vec<(Wk<SymbolKey>, generics::TypeArgs)> = vec![];
         for base in class_stmt.bases() {
+            // `Generic[T]`, `Protocol[T]`: type parameters, not a base to look members up in.
+            if let Some(params) = self.declared_type_params(session, base, base_position) {
+                declared_params.get_or_insert_with(Vec::new).extend(params);
+                continue;
+            }
             let mut deps = vec![vec![], vec![]];
-            let eval_base = Evaluation::eval_from_ast(session, base, *self.sym_stack.last().unwrap(), &class_stmt.range().start(), false, &mut deps);
+            let eval_base = Evaluation::eval_from_ast(session, base, *self.sym_stack.last().unwrap(), &base_position, false, &mut deps);
             session.st_mut().insert_dependencies(self.file, &deps, BuildSteps::ARCH_EVAL);
             self.diagnostics.extend(eval_base.1);
             let eval_base = eval_base.0;
@@ -690,6 +855,7 @@ impl PythonArchEval {
             }
             let eval_base = &eval_base[0];
             let eval_symbol = eval_base.symbol.get_symbol(session, None, &mut vec![], None);
+            let eval_type_args = generics::type_args(&eval_symbol).cloned();
             let ref_sym = SymbolTable::follow_ref(&eval_symbol, session, None, false, true, None, None);
             if ref_sym.len() > 1 {
                 self.diagnostics.extend(create_diag(session, DiagnosticCode::OLS01003, &[&AstUtils::flatten_expr(base)], base.range()));
@@ -714,9 +880,26 @@ impl PythonArchEval {
                     }
                 }
                 session.st_mut()[loc_sym].bases.push(c.into());
+                if let Some(args) = eval_type_args {
+                    base_args.push((symbol.into(), args));
+                }
             } else if !matches!(symbol, SymbolKey::Variable(_)) || session.st()[symbol.unwrap_variable_key()].is_value() { // if it's a variable and not a value, it means we can't evaluate it, let's skip diagnostic
                 self.diagnostics.extend(create_diag(session, DiagnosticCode::OLS01002, &[&AstUtils::flatten_expr(base)], base.range()));
             }
+        }
+        if pep695.is_some() {
+            self.sym_stack.pop();
+        }
+        // PEP 484: without `Generic[...]`, the type variables of the bases' arguments, in order.
+        let params = declared_params.unwrap_or_else(|| {
+            let mut params = vec![];
+            for (_, args) in base_args.iter() {
+                Self::collect_type_vars(session, args, &mut params);
+            }
+            params
+        });
+        if !params.is_empty() || !base_args.is_empty() {
+            session.st_mut()[loc_sym].generics = Some(Box::new(generics::ClassGenerics { params, base_args }));
         }
     }
 
@@ -753,6 +936,11 @@ impl PythonArchEval {
             return; // can be not found if AST is incomplete
         };
         let f = function_sym_key.unwrap_function_key();
+        // `def f[T](x: T) -> T`: the annotations see the type parameters, declared in the function.
+        let (annotation_scope, annotation_position) = match Self::pep695_type_params(session, f.into(), func_stmt.type_params.as_deref()) {
+            Some((_, end)) => (SymbolKey::from(f), end),
+            None => (scope, func_stmt.range.start()),
+        };
         let func = &session.st()[f];
         let is_static = func.is_static;
         if func.can_be_in_class() || !matches!(scope, SymbolKey::Class(_)) {
@@ -776,8 +964,8 @@ impl PythonArchEval {
                     }
                     let (eval, diags) = Evaluation::eval_from_ast(session,
                                                 annotation,
-                                                scope,
-                                                &func_stmt.range.start(),
+                                                annotation_scope,
+                                                &annotation_position,
                                                 true,
                                                 &mut deps);
                     session.st_mut().insert_dependencies(self.file, &deps, self.current_step);
@@ -949,7 +1137,16 @@ impl PythonArchEval {
                         //Value is not coming from the unpack, because value on the right is not a tuple or list, or there is too many values to unpack
                         //We can then evaluate the right side by searching for an __iter__ method and assign the return value to the variable.
                         //We restrict that to the case where target is a simple variable, because we don't want to try to unpack the return value of the method (for now)
-                        if variables.len() != 1 {continue;}
+                        if variables.len() != 1 {
+                            // `for key, value in mapping.items()`: the elements of a typed tuple item.
+                            if let Some(items) = self.generic_iteration_items(session, &for_stmt.iter, &for_stmt.target.range().start(), &mut deps) {
+                                let elements: Vec<Evaluation> = items.iter()
+                                    .flat_map(|item| Self::tuple_element(session, item, index, variables.len()))
+                                    .collect();
+                                session.st_mut()[variable].evaluations.extend(elements);
+                            }
+                            continue;
+                        }
                         //if None but the value is a tuple or list, it means that the unpacking failed because too many values to unpack
                         if matches!(for_stmt.iter.as_ref(), Expr::Tuple(_)) ||
                         matches!(for_stmt.iter.as_ref(), Expr::List(_)) ||
@@ -967,18 +1164,35 @@ impl PythonArchEval {
                                 let symbol_eval = SymbolTable::follow_ref(&eval_symbol, session, None, false, false, None, None);
                                 if symbol_eval.len() == 1 && let Some(symbol_type) = symbol_eval[0].upgrade_weak(session.st())
                                     && matches!(symbol_type, SymbolKey::Class(_)) {
+                                        let iterable_args = generics::type_args(&symbol_eval[0]).cloned();
                                         let (iters, _) = SymbolTable::get_member_symbol(session, symbol_type, "__iter__", None, true, false, false, false, false);
                                         if let Some(&SymbolKey::Function(iter)) = iters.first() && iters.len() == 1 {
-                                            SyncOdoo::ensure_func_evaluations(session, iter);
+                                            let iter_bindings = generics::owner_class(session, iter.into())
+                                                .filter(|&owner| generics::may_bind(session, symbol_type, owner, iterable_args.is_some()))
+                                                .map(|owner| generics::bindings_for(session, symbol_type, iterable_args.as_ref(), owner))
+                                                .unwrap_or_default();
+                                            if iter_bindings.is_empty() {
+                                                SyncOdoo::ensure_func_evaluations(session, iter);
+                                            } else {
+                                                SyncOdoo::ensure_generic_func_evaluations(session, iter);
+                                            }
                                             let evals = &session.st()[iter].evaluations;
                                             if evals.len() == 1 {
                                                 let eval_iter = evals[0].clone();
                                                 if for_stmt.target.is_name_expr() { //only handle simple variable for now
                                                     let variable = session.st().get_positioned_symbol(*self.sym_stack.last().unwrap(), &for_stmt.target.as_name_expr().unwrap().id, &for_stmt.target.range());
-
-                                                    let symbol = eval_iter.symbol.get_symbol_as_weak(session, Some(&Context::from_iter([(ContextKey::ParentFor, ContextValue::SYMBOL(symbol_type.into()))])), &mut vec![], None);
                                                     let v = variable.unwrap().unwrap_variable_key();
-                                                    session.st_mut()[v].evaluations = vec![Evaluation::eval_from_symbol(session.st(), symbol.weak, symbol.instance)];
+                                                    // An iterator (`Iterator[Item]`): the items are what its `__next__` returns.
+                                                    if let Some(items) = Self::iteration_items(session, &eval_iter, &iter_bindings, &symbol_eval[0]) {
+                                                        session.st_mut()[v].evaluations = items;
+                                                    } else if Self::returns_iterator(session, &eval_iter) {
+                                                        // An iterator whose items are unknown (`[]`, `list` without type
+                                                        // arguments): the iterator is not the item.
+                                                        session.st_mut()[v].evaluations = vec![];
+                                                    } else {
+                                                        let symbol = eval_iter.symbol.get_symbol_as_weak(session, Some(&Context::from_iter([(ContextKey::ParentFor, ContextValue::SYMBOL(symbol_type.into()))])), &mut vec![], None);
+                                                        session.st_mut()[v].evaluations = vec![Evaluation::eval_from_symbol(session.st(), symbol.weak, symbol.instance)];
+                                                    }
                                                 }
                                             }
                                         }
@@ -1123,12 +1337,17 @@ impl PythonArchEval {
 
         if let Some(returns_ann) = func_stmt.returns.as_ref() {
             let mut deps = vec![vec![], vec![]];
-            let parent = session.st()[func_sym].parent();
+            let parent: SymbolKey = session.st()[func_sym].parent().into();
+            // `def f[T](...) -> T`: the type parameters are declared in the function.
+            let (scope, max_infer) = match Self::pep695_type_params(session, func_sym.into(), func_stmt.type_params.as_deref()) {
+                Some((_, end)) => (SymbolKey::from(func_sym), end),
+                None => (parent, *max_infer),
+            };
             let (mut evaluations, diags) = Evaluation::eval_from_ast(
                 session,
                 returns_ann,
-                parent,
-                max_infer,
+                scope,
+                &max_infer,
                 true,
                 &mut deps,
             );
@@ -1152,9 +1371,11 @@ impl PythonArchEval {
                 return;
             }
             for eval in evaluations.iter_mut() { //as this is an evaluation, we need to set the instance to true
-                if let EvaluationSymbolPtr::WEAK(sym_weak) = eval.symbol.get_mut_symbol_ptr() {
-                    sym_weak.instance = Some(true);
-                }
+                // ...except for `-> type[X]`, which returns the class X itself.
+                if let EvaluationSymbolPtr::WEAK(sym_weak) = eval.symbol.get_mut_symbol_ptr()
+                    && sym_weak.instance != Some(false) {
+                        sym_weak.instance = Some(true);
+                    }
             }
             if let Some(file_sym) = session.st().get_file(func_sym.into()) {
                 session.st_mut().insert_dependencies(file_sym, &deps, BuildSteps::ARCH_EVAL);

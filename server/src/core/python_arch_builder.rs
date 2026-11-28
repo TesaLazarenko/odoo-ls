@@ -667,6 +667,21 @@ impl PythonArchBuilder {
         }
     }
 
+    /// PEP 695 type parameters (`class C[T]`, `def f[T]`): type variables of the class or
+    /// function, visible to its bases, annotations and body.
+    fn add_type_params(session: &mut SessionInfo, scope: SymbolKey, type_params: Option<&ruff_python_ast::TypeParams>) {
+        let Some(type_params) = type_params else { return };
+        for type_param in type_params.type_params.iter() {
+            let (name, range) = match type_param {
+                ruff_python_ast::TypeParam::TypeVar(t) => (&t.name, t.range),
+                ruff_python_ast::TypeParam::ParamSpec(p) => (&p.name, p.range),
+                ruff_python_ast::TypeParam::TypeVarTuple(t) => (&t.name, t.range),
+            };
+            let variable = session.st_mut().add_new_variable(scope, name.as_str(), range);
+            session.st_mut()[variable].is_type_param = true;
+        }
+    }
+
     fn handle_func_args(function_key: FunctionKey, session: &mut SessionInfo, parameters: &Parameters) {
         for arg in parameters.posonlyargs.iter() {
             let param = session.st_mut().add_new_variable(function_key, &arg.parameter.name.id, arg.range);
@@ -772,6 +787,7 @@ impl PythonArchBuilder {
             }
         }
         //add params
+        PythonArchBuilder::add_type_params(session, function_key.into(), func_def.type_params.as_deref());
         PythonArchBuilder::handle_func_args(function_key, session, &func_def.parameters);
         let mut add_noqa = false;
         if let Some(noqa_bloc) = session.file_mgr()[self.file_info].noqas_blocs.get(&func_def.range.start().to_u32()) {
@@ -801,6 +817,7 @@ impl PythonArchBuilder {
         let parent = *self.sym_stack.last().unwrap();
         let class_key = session.st_mut().add_new_class(
             parent, class_def.name.id.as_str(), class_def.range, class_def.body.first().unwrap().range().start());
+        PythonArchBuilder::add_type_params(session, class_key.into(), class_def.type_params.as_deref());
 
         if !class_def.body.is_empty() && class_def.body[0].is_expr_stmt() {
             let expr = class_def.body[0].as_expr_stmt().unwrap();

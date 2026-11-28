@@ -10,6 +10,7 @@ pub mod evaluation_context;
 pub mod evaluation_utils;
 pub mod entry_point;
 pub mod file_mgr;
+pub mod generics;
 pub mod import_resolver;
 pub mod js_arch_builder;
 pub mod js_import_graph;
